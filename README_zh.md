@@ -550,6 +550,19 @@ stateDiagram-v2
 - **双向剪贴板（V3）** — 剪贴板数据通过数据通道双向流动，使用头部 + 负载两包协议。回声保护防止循环。变长事件要求所有接收者排空尾随负载
 - **必须排空协议** — 任何带变长负载的事件类型（目前为剪贴板）**必须**通过 `handle_unhandled_event()` 或 `*_extend_data()` 排空，即使调用者不关心数据。否则会损坏数据通道流
 
+### Niri：交帧前等待 GPU 完成
+
+在 Niri 的 `debug` 块中加入此开关，Anland 会等待 GPU 完成当前帧后再交给 Android：
+
+```kdl
+debug {
+    wait-for-frame-completion-before-queueing
+}
+```
+
+开启后会阻塞合成器等待当前帧，可能降低吞吐。默认仍把原生 acquire fence 交给
+Android，仅在无法导出 fence 时由合成器等待。
+
 ---
 
 ## 12. V2 至 V3 API 变更

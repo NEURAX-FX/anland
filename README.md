@@ -592,6 +592,21 @@ stateDiagram-v2
   `*_extend_data()`, even if the caller does not care about the data. Failure to do
   so corrupts the data channel stream.
 
+### Niri: wait before handing off a frame
+
+Add this flag to Niri's `debug` block to make the Anland backend wait for
+GPU rendering to complete before handing the frame to Android:
+
+```kdl
+debug {
+    wait-for-frame-completion-before-queueing
+}
+```
+
+This blocks the compositor until the frame is ready, so it can reduce
+throughput. By default, Anland passes a native acquire fence to Android and
+waits on the CPU only if that fence cannot be exported.
+
 ---
 
 ## 12. API Changes from V2

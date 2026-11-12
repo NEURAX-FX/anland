@@ -1069,15 +1069,21 @@ impl Anland {
 
         niri.update_primary_scanout_output(output, &states);
 
-        // Hand a native fence to the consumer so it can wait on the render
-        // GPU-side. freedreno/KGSL advertises EGL_ANDROID_native_fence_sync but
-        // eglDupNativeFenceFDANDROID fails at runtime (EGL_BAD_PARAMETER), so
-        // export() comes up empty even when is_exportable() is true. Without a
-        // real fence the consumer presents a half-rendered buffer → flicker /
-        // corruption under complex composites. Work around it by blocking on the
-        // render fence CPU-side before handing the buffer over.
-        let fence = if sync.is_exportable() { sync.export() } else { None };
+        // Normally Android waits on the native fence. Wait here instead if the
+        // Niri debug option is enabled or native fence export is unavailable
+        // (including drivers such as freedreno/KGSL where export can fail).
+        let force_sync = niri
+            .config
+            .borrow()
+            .debug
+            .wait_for_frame_completion_before_queueing;
+        let fence = if !force_sync && sync.is_exportable() {
+            sync.export()
+        } else {
+            None
+        };
         if fence.is_none() {
+            let _span = tracy_client::span!("wait for completion");
             if let Err(err) = sync.wait() {
                 warn!("anland: render fence wait failed: {err}");
                 self.buffer_last_rendered_frame[idx as usize] = u64::MAX;
