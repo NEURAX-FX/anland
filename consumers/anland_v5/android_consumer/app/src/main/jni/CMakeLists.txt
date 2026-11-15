@@ -26,8 +26,26 @@ if(ANLAND_TRACY)
     )
 endif()
 
+# Compile shaders with the host tool from the NDK, not a target executable.
+find_program(ANLAND_GLSLC NAMES glslc
+    PATHS "${CMAKE_ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}"
+    NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+
+foreach(stage IN ITEMS vert frag)
+    set(shader "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_output.${stage}")
+    set(words "${CMAKE_CURRENT_BINARY_DIR}/vulkan_output_${stage}.inc")
+    add_custom_command(OUTPUT "${words}"
+        COMMAND "${ANLAND_GLSLC}" --target-env=vulkan1.0 -O -mfmt=num "${shader}" -o "${words}"
+        DEPENDS "${shader}" "${ANLAND_GLSLC}"
+        VERBATIM)
+    list(APPEND ANLAND_SHADER_WORDS "${words}")
+endforeach()
+
 add_library(anland_consumer SHARED
     native_consumer.c
+    window_output.c
+    vulkan_output.c
+    ${ANLAND_SHADER_WORDS}
     native_audio.c
     camera_service.c
     ${LIBDISPLAY_DIR}/libdisplay_consumer/display_consumer.c
@@ -37,6 +55,7 @@ add_library(anland_consumer SHARED
 target_include_directories(anland_consumer PRIVATE
     ${LIBDISPLAY_DIR}/libdisplay_consumer
     ${LIBDISPLAY_DIR}/common
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_compile_options(anland_consumer PRIVATE -O3 -flto)
@@ -44,6 +63,9 @@ target_link_options(anland_consumer PRIVATE -flto -fuse-ld=lld)
 
 target_link_libraries(anland_consumer
     android
+    EGL
+    GLESv3
+    vulkan
     log
     dl
     aaudio

@@ -10,7 +10,7 @@ use std::ptr::NonNull;
 
 pub use ffi::{InputEvent, Output, SceneEvent};
 
-pub const PRESENTED: u32 = ffi::EVENT_PRESENTED;
+pub const FRAME_CONSUMED: u32 = ffi::EVENT_FRAME_CONSUMED;
 pub const BUFFER_RELEASED: u32 = ffi::EVENT_BUFFER_RELEASED;
 pub const COMMIT_DROPPED: u32 = ffi::EVENT_COMMIT_DROPPED;
 pub const OUTPUT_CHANGED: u32 = ffi::EVENT_OUTPUT_CHANGED;
@@ -116,6 +116,22 @@ impl Client {
             modifier: out.modifier,
             fd,
         })
+    }
+
+    pub fn allow_gpu_staging(&mut self) {
+        unsafe { ffi::anland_niri_allow_gpu_staging(self.0.as_ptr()) };
+    }
+
+    pub fn uses_gpu_staging(&self) -> bool {
+        unsafe { ffi::anland_niri_uses_gpu_staging(self.0.as_ptr()) != 0 }
+    }
+
+    pub fn take_slot_fence(&mut self, generation: u64, index: u32) -> io::Result<Option<OwnedFd>> {
+        match unsafe { ffi::anland_niri_take_slot_fence(self.0.as_ptr(), generation, index) } {
+            -1 => Ok(None),
+            fd if fd >= 0 => Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) })),
+            _ => Err(failed("take staging slot fence")),
+        }
     }
 
     /// Commit only the currently published target. `fence` is borrowed by the C

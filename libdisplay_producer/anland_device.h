@@ -95,6 +95,7 @@ enum {
     ANLAND_DEVICE_IN_TABLET_POSITION = 14,
     ANLAND_DEVICE_IN_TABLET_TILT     = 15,
     ANLAND_DEVICE_IN_TABLET_FRAME    = 16,
+    ANLAND_DEVICE_IN_FRAME_PRESENTATION = 17,
 };
 
 /* Touch/button action codes carried by ANLAND_DEVICE_IN_TOUCH /
@@ -140,6 +141,8 @@ typedef struct anland_device_input {
         struct { uint32_t tool_id; float x, y, pressure; } tablet_position;
         struct { uint32_t tool_id; float tilt_x, tilt_y, distance; } tablet_tilt;
         struct { uint32_t tool_id, flags, buttons, time_msec; } tablet_frame;
+        /* Packed member preserves the existing 4-byte union alignment/offset. */
+        struct { uint64_t serial, presentation_ns; } __attribute__((packed)) frame_presentation;
         struct { uint32_t padding[4]; };
     };
 } anland_device_input_t;
@@ -236,8 +239,15 @@ void anland_device_set_pre_release_cb(anland_device *dev,
 
 /* Data channel fd (consumer input / our output events). */
 int anland_device_data_fd(anland_device *dev);
-/* eventfd signalled when the consumer has presented a frame (buffer-ready). */
+/* Readable on target selection: legacy eventfd or negotiated fence socket. */
 int anland_device_buffer_ready_fd(anland_device *dev);
+int anland_device_read_buffer_ready(anland_device *dev);
+/* Opt in only when the producer can import the Android fence on the GPU and
+ * apply the cache policy to its staging DMA-BUF. Persists across reconnect. */
+void anland_device_allow_gpu_staging(anland_device *dev);
+bool anland_device_uses_gpu_staging(const anland_device *dev);
+/* Called before drawing. Returns an owned release fd, -1 if complete, -2 if not ready. */
+int anland_device_take_slot_fence(anland_device *dev);
 /* Audio socketpair endpoint (playback+capture PCM), or -1 in fallback. */
 int anland_device_audio_fd(anland_device *dev);
 

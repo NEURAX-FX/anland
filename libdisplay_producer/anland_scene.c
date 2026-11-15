@@ -65,6 +65,7 @@ struct anland_scene {
 
     uint64_t next_commit_id;
     uint64_t generation;
+    bool frame_consumed_enabled;
 
     struct inflight inflight[ANLAND_SCENE_INFLIGHT_MAX];
 
@@ -177,17 +178,6 @@ static void queue_event_locked(anland_scene *s, const anland_scene_event_t *ev)
     signal_event_fd_locked(s);
 }
 
-static void queue_presented_locked(anland_scene *s, uint64_t commit_id,
-                                   uint64_t presentation_ns)
-{
-    anland_scene_event_t ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.type = ANLAND_SCENE_EVENT_PRESENTED;
-    ev.commit_id = commit_id;
-    ev.u.presented.presentation_ns = presentation_ns;
-    queue_event_locked(s, &ev);
-}
-
 static void queue_dropped_locked(anland_scene *s, uint64_t commit_id,
                                  anland_scene_drop_reason_t reason)
 {
@@ -294,17 +284,21 @@ static void release_snapshot_buffers_locked(anland_scene *s,
  * release fence). A dropped commit is different — nothing was handed over — so
  * its buffers are retired here. Caller holds the lock. */
 static void complete_commit_locked(anland_scene *s, struct inflight *fl,
-                                   bool presented, uint64_t presentation_ns,
+                                   anland_scene_event_type_t outcome, uint64_t presentation_ns,
                                    anland_scene_drop_reason_t reason)
 {
     const uint64_t commit_id = fl->snapshot.commit_id;
 
-    if (presented)
-        queue_presented_locked(s, commit_id, presentation_ns);
-    else
+    if (outcome == ANLAND_SCENE_EVENT_COMMIT_DROPPED) {
         queue_dropped_locked(s, commit_id, reason);
+    } else {
+        anland_scene_event_t ev = { .type = outcome, .commit_id = commit_id };
+        if (outcome == ANLAND_SCENE_EVENT_PRESENTED)
+            ev.u.presented.presentation_ns = presentation_ns;
+        queue_event_locked(s, &ev);
+    }
 
-    if (!presented && !fl->handed_off) {
+    if (outcome == ANLAND_SCENE_EVENT_COMMIT_DROPPED && !fl->handed_off) {
         release_snapshot_buffers_locked(s, fl);
     }
 
@@ -423,6 +417,15 @@ void anland_scene_destroy(anland_scene *s)
     free(s);
 }
 
+void anland_scene_enable_frame_consumed(anland_scene *s)
+{
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->lock);
+    s->frame_consumed_enabled = true;
+    pthread_mutex_unlock(&s->lock);
+}
+
 uint64_t anland_scene_generation(const anland_scene *s)
 {
     if (!s)
@@ -486,8 +489,8 @@ int anland_scene_invalidate(anland_scene *s)
              * release for handed-off commits. */
             if (s->inflight[i].handed_off)
                 release_snapshot_buffers_locked(s, &s->inflight[i]);
-            complete_commit_locked(s, &s->inflight[i], false, 0,
-                                   ANLAND_SCENE_DROP_INVALIDATED);
+            complete_commit_locked(s, &s->inflight[i], ANLAND_SCENE_EVENT_COMMIT_DROPPED,
+                                   0, ANLAND_SCENE_DROP_INVALIDATED);
         }
     }
 
@@ -572,8 +575,8 @@ int anland_scene_layer_destroy(anland_scene *s, anland_layer_id id)
             continue;
         for (size_t j = 0; j < fl->snapshot.count; j++) {
             if (fl->snapshot.layers[j].layer_id == id) {
-                complete_commit_locked(s, fl, false, 0,
-                                       ANLAND_SCENE_DROP_INVALIDATED);
+                complete_commit_locked(s, fl, ANLAND_SCENE_EVENT_COMMIT_DROPPED,
+                                       0, ANLAND_SCENE_DROP_INVALIDATED);
                 break;
             }
         }
@@ -755,8 +758,8 @@ int anland_scene_backend_handed_off(anland_scene *s, uint64_t commit_id)
     return fl ? 0 : -1;
 }
 
-int anland_scene_backend_presented(anland_scene *s, uint64_t commit_id,
-                                   uint64_t presentation_ns)
+static int backend_completed(anland_scene *s, uint64_t commit_id,
+                             anland_scene_event_type_t outcome, uint64_t presentation_ns)
 {
     if (!s || commit_id == 0)
         return -1;
@@ -767,9 +770,22 @@ int anland_scene_backend_presented(anland_scene *s, uint64_t commit_id,
         pthread_mutex_unlock(&s->lock);
         return -1; /* already completed, or never known */
     }
-    complete_commit_locked(s, fl, true, presentation_ns, 0);
+    if (outcome == ANLAND_SCENE_EVENT_FRAME_CONSUMED && !s->frame_consumed_enabled)
+        outcome = ANLAND_SCENE_EVENT_PRESENTED;
+    complete_commit_locked(s, fl, outcome, presentation_ns, 0);
     pthread_mutex_unlock(&s->lock);
     return 0;
+}
+
+int anland_scene_backend_presented(anland_scene *s, uint64_t commit_id,
+                                   uint64_t presentation_ns)
+{
+    return backend_completed(s, commit_id, ANLAND_SCENE_EVENT_PRESENTED, presentation_ns);
+}
+
+int anland_scene_backend_consumed(anland_scene *s, uint64_t commit_id)
+{
+    return backend_completed(s, commit_id, ANLAND_SCENE_EVENT_FRAME_CONSUMED, 0);
 }
 
 int anland_scene_backend_dropped(anland_scene *s, uint64_t commit_id,
@@ -784,7 +800,7 @@ int anland_scene_backend_dropped(anland_scene *s, uint64_t commit_id,
         pthread_mutex_unlock(&s->lock);
         return -1;
     }
-    complete_commit_locked(s, fl, false, 0, reason);
+    complete_commit_locked(s, fl, ANLAND_SCENE_EVENT_COMMIT_DROPPED, 0, reason);
     pthread_mutex_unlock(&s->lock);
     return 0;
 }
@@ -938,6 +954,8 @@ const char *anland_scene_event_type_name(anland_scene_event_type_t type)
         return "OUTPUT_CHANGED";
     case ANLAND_SCENE_EVENT_RENDER_TARGET_READY:
         return "RENDER_TARGET_READY";
+    case ANLAND_SCENE_EVENT_FRAME_CONSUMED:
+        return "FRAME_CONSUMED";
     }
     return "UNKNOWN";
 }

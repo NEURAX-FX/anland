@@ -1,16 +1,15 @@
-//! Anland backend: renders niri directly into the Android consumer's dmabufs.
+//! Anland backend: renders into a staging DMA-BUF selected by the Android consumer.
 //!
-//! The anland transport is a buffer-sharing protocol: the Android consumer owns a
-//! set of dmabufs (plus a "buffer ready" eventfd, a data socket and a fence
-//! socket). We render niri's scene into the consumer-selected dmabuf with EGL,
-//! hand over a native fence and `trigger_refresh()`, then wait for the consumer's
-//! buffer-ready signal before completing the frame.
+//! The fence channel hands the rendered buffer to Android. The next slot
+//! selection retires the transport handoff and permits a new render; only
+//! Android's separate display timestamp confirms presentation.
 
 pub mod client;
 pub use client::ffi;
 pub mod frame_state;
 pub mod input;
 mod clipboard;
+mod gpu_staging;
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::input::keyboard::xkb;
 
@@ -25,10 +24,11 @@ use anyhow::Context as _;
 use niri_config::OutputName;
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
 use smithay::backend::allocator::{Fourcc, Modifier};
+use smithay::backend::egl::fence::EGLFence;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::damage::{OutputDamageTracker, RenderOutputResult};
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{Capability, GlesRenderer};
 use smithay::backend::renderer::{Bind, Color32F, ImportDma};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -46,9 +46,8 @@ use crate::niri::{Niri, RedrawState};
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
 
-/// How often we poll the consumer for input, buffer-ready and reconnects.
-/// Kept at 1 ms so buffer-ready (our "vblank") is picked up with minimal
-/// latency; the anland lockstep throughput is bound by this plus the render.
+/// Poll for transport progress and input without treating a buffer-ready wakeup
+/// as a display vsync. The lockstep producer waits for the consumer's selection.
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// How long a new consumer buffer size must remain unchanged before it becomes
@@ -181,6 +180,7 @@ pub struct Anland {
     screen_h: u32,
     screen_refresh: u32,
     renderer: Option<GlesRenderer>,
+    gpu_import_policy: Option<gpu_staging::ImportPolicy>,
     damage_tracker: Option<OutputDamageTracker>,
     dmabuf_global: Option<DmabufGlobal>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
@@ -191,11 +191,7 @@ pub struct Anland {
     /// first observed continuously.
     pending_size: Option<(i32, i32, u64)>,
     size_adapt_cooldown_until: u64,
-    /// Whether the consumer has presented the last frame (or just connected) and
-    /// is ready for another one. Gates rendering so we never draw into a buffer
-    /// the consumer is still displaying.
-
-    pending_feedback: Option<OutputPresentationFeedback>,
+    presentation_reports: frame_state::PresentationReports<OutputPresentationFeedback>,
     frame_seq: u64,
     frame_stats_count: u32,
     frame_stats_start: Duration,
@@ -268,6 +264,7 @@ impl Anland {
             screen_h: height,
             screen_refresh: refresh,
             renderer: None,
+            gpu_import_policy: None,
             damage_tracker: None,
             dmabuf_global: None,
             ipc_outputs,
@@ -277,7 +274,7 @@ impl Anland {
             pending_size: None,
             size_adapt_cooldown_until: 0,
 
-            pending_feedback: None,
+            presentation_reports: frame_state::PresentationReports::new(),
             frame_seq: 0,
             frame_stats_count: 0,
             frame_stats_start: Duration::ZERO,
@@ -404,6 +401,22 @@ impl Anland {
 
         resources::init(&mut renderer);
         shaders::init(&mut renderer);
+
+        if let Some(path) = std::env::var_os("ANLAND_PANVK_ICD") {
+            if EGLFence::supports_importing(&display)
+                && renderer.capabilities().contains(&Capability::ExportFence)
+            {
+                match gpu_staging::ImportPolicy::load(std::path::Path::new(&path)) {
+                    Ok(policy) => {
+                        self.gpu_import_policy = Some(policy);
+                        self.client.allow_gpu_staging();
+                    }
+                    Err(err) => warn!("anland: GPU staging unavailable: {err:#}"),
+                }
+            } else {
+                warn!("anland: GPU staging needs EGL native fence import/export");
+            }
+        }
 
         self.renderer = Some(renderer);
         Ok(())
@@ -556,6 +569,7 @@ impl Anland {
             }
         }
         self.dispatch_scene(niri);
+        self.presentation_reports.expire(get_monotonic_time());
         if self.selection_rx.try_recv().is_ok() {
             self.clipboard_read_pending = true;
         }
@@ -639,11 +653,15 @@ impl Anland {
         self.pending_text_keysyms.clear();
         self.pending_size = None;
         self.size_adapt_cooldown_until = 0;
-        self.pending_feedback = None; // discarded: no false presentation
+        self.presentation_reports.reset(); // Discard outstanding feedback from this session.
         self.consumer_dmabufs = [const { None }; ffi::MAX_BUFS];
         self.buffer_last_rendered_frame = [u64::MAX; ffi::MAX_BUFS];
         if let Some(output) = self.output.as_ref() {
             if let Some(state) = niri.output_state.get_mut(output) {
+                state.frame_clock = crate::frame_clock::FrameClock::new(
+                    state.frame_clock.refresh_interval(),
+                    false,
+                );
                 if matches!(state.redraw_state, RedrawState::WaitingForVBlank { .. }) {
                     state.redraw_state = RedrawState::Idle;
                 }
@@ -659,21 +677,17 @@ impl Anland {
         for event in events {
             let e = event.data;
             match e.type_ {
-                client::PRESENTED => {
-                    if self.frame_state.presented(e.commit_id) == frame_state::FrameAction::Complete(e.commit_id) {
-                        self.on_frame_presented(niri);
+                client::FRAME_CONSUMED => {
+                    if self.frame_state.consumed(e.commit_id)
+                        == frame_state::FrameAction::Complete(e.commit_id)
+                    {
+                        self.finish_frame_handoff(niri);
                     }
                 }
                 client::COMMIT_DROPPED => {
                     if self.frame_state.dropped(e.commit_id) == frame_state::FrameAction::Cancel(e.commit_id) {
-                        self.pending_feedback = None;
-                        if let Some(output) = self.output.as_ref() {
-                            if let Some(state) = niri.output_state.get_mut(output) {
-                                if matches!(state.redraw_state, RedrawState::WaitingForVBlank { .. }) {
-                                    state.redraw_state = RedrawState::Idle;
-                                }
-                            }
-                        }
+                        self.presentation_reports.discard(e.commit_id);
+                        self.finish_frame_handoff(niri);
                     }
                 }
                 client::RENDER_TARGET_READY => {
@@ -740,7 +754,7 @@ impl Anland {
             self.client.drop_session();
             return;
         }
-        info!("anland: consumer session generation {generation}");
+        info!("anland: consumer session generation {generation} (GPU staging: {})", self.client.uses_gpu_staging());
         self.session_generation = Some(generation);
         self.frame_state.reset(generation);
         self.pending_text_keysyms.clear();
@@ -782,6 +796,9 @@ impl Anland {
                     self.update_output_mode(niri, &output, self.screen_w as i32,
                         self.screen_h as i32, raw.refresh_mhz);
                 }
+            }
+            ffi::INPUT_TYPE_FRAME_PRESENTATION => {
+                self.on_display_presentation(niri, raw.presentation_serial, raw.presentation_ns);
             }
             ffi::INPUT_TYPE_CLIPBOARD | ffi::INPUT_TYPE_TEXT_INPUT => {
                 match self.client.read_payload(raw.payload_size as usize) {
@@ -910,21 +927,34 @@ impl Anland {
         );
     }
 
-    fn on_frame_presented(&mut self, niri: &mut Niri) {
+    fn finish_frame_handoff(&mut self, niri: &mut Niri) {
         let Some(output) = self.output.as_ref() else { return; };
         let Some(state) = niri.output_state.get_mut(output) else { return; };
         if !matches!(state.redraw_state, RedrawState::WaitingForVBlank { .. }) {
             return;
         }
         state.redraw_state = RedrawState::Idle;
-        let now = get_monotonic_time();
-        if let Some(mut feedback) = self.pending_feedback.take() {
-            let refresh = state.frame_clock.refresh_interval().map(Refresh::Fixed).unwrap_or(Refresh::Unknown);
-            // Legacy acknowledgement does not prove physical scanout.
-            feedback.presented::<_, smithay::utils::Monotonic>(now, refresh,
-                self.frame_seq, wp_presentation_feedback::Kind::Vsync);
+    }
+
+    fn on_display_presentation(&mut self, niri: &mut Niri, serial: u64, ns: u64) {
+        let Some((time, mut feedback, update_clock)) =
+            self.presentation_reports.reported(serial, ns, get_monotonic_time())
+        else {
+            return;
+        };
+        // EGL reports when scanout began, not the retrace count, hardware
+        // flags, or when the next Android refresh will occur.
+        feedback.presented::<_, smithay::utils::Monotonic>(
+            time,
+            Refresh::Unknown,
+            0,
+            wp_presentation_feedback::Kind::empty(),
+        );
+        if update_clock {
+            if let Some(state) = self.output.as_ref().and_then(|o| niri.output_state.get_mut(o)) {
+                state.frame_clock.presented(time);
+            }
         }
-        state.frame_clock.presented(now);
     }
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let span = tracy_client::span!("Anland::render");
@@ -939,6 +969,7 @@ impl Anland {
         };
         let idx = target.index as i32;
         let info = &target;
+        let gpu_staging = self.client.uses_gpu_staging();
         span.emit_text(&format!(
             "buffer {idx} {}x{} stride {}",
             info.width, info.height, info.stride
@@ -978,6 +1009,7 @@ impl Anland {
 
         let render_start = get_monotonic_time();
 
+        let new_import = self.consumer_dmabufs[idx as usize].is_none();
         let mut dmabuf = match self.consumer_dmabufs[idx as usize].take() {
             Some(dmabuf) => dmabuf,
             None => {
@@ -1029,17 +1061,42 @@ impl Anland {
         // Do not advance the buffer age until a frame is actually submitted.
         // Failed binds/renders must not make the old pixels look fresh.
 
-        // Render them into the consumer's dmabuf.
-        let damage_tracker = self.damage_tracker.as_mut().unwrap();
-        let mut target = match renderer.bind(&mut dmabuf) {
+        let mut target = match if gpu_staging && new_import {
+            self.gpu_import_policy.as_ref()
+                .context("missing scoped PanVK import")
+                .and_then(|policy| policy.bind(renderer, &mut dmabuf, info.fd.as_raw_fd()))
+                .inspect(|_| info!("anland: PanVK GPU-uncached staging import confirmed"))
+        } else {
+            renderer.bind(&mut dmabuf).context("bind staging DMA-BUF")
+        } {
             Ok(target) => target,
             Err(err) => {
-                warn!("anland: error binding dmabuf: {err}");
-                // The bind result still borrows dmabuf in this match arm.
-                // A later attempt must reconstruct the import from the owned fd.
+                warn!("anland: {err:#}");
+                if gpu_staging {
+                    self.client.drop_session();
+                    self.on_session_lost(niri);
+                }
                 return RenderResult::Skipped;
             }
         };
+        let release = if gpu_staging {
+            match self.client.take_slot_fence(generation, index)
+                .context("receive Android staging release")
+                .and_then(|fd| gpu_staging::queue_release_wait(renderer, fd))
+            {
+                Ok(release) => release,
+                Err(err) => {
+                    warn!("anland: {err:#}; retiring GPU staging slot");
+                    drop(target);
+                    self.client.drop_session();
+                    self.on_session_lost(niri);
+                    return RenderResult::Skipped;
+                }
+            }
+        } else {
+            None
+        };
+        let damage_tracker = self.damage_tracker.as_mut().unwrap();
         let res = match damage_tracker.render_output(
             renderer,
             &mut target,
@@ -1052,11 +1109,17 @@ impl Anland {
                 warn!("anland: error rendering to dmabuf: {err}");
                 self.buffer_last_rendered_frame[idx as usize] = u64::MAX;
                 drop(target);
+                if gpu_staging {
+                    self.client.drop_session();
+                    self.on_session_lost(niri);
+                    return RenderResult::Skipped;
+                }
                 self.consumer_dmabufs[idx as usize] = Some(dmabuf);
                 return RenderResult::Skipped;
             }
         };
-        let RenderOutputResult { sync, states, .. } = res;
+        let RenderOutputResult { sync, states, damage } = res;
+        let drew = damage.is_some();
 
         // The target borrows `dmabuf`; drop it now so we can store the dmabuf
         // back into the cache below.
@@ -1069,20 +1132,28 @@ impl Anland {
 
         niri.update_primary_scanout_output(output, &states);
 
-        // Normally Android waits on the native fence. Wait here instead if the
-        // Niri debug option is enabled or native fence export is unavailable
-        // (including drivers such as freedreno/KGSL where export can fail).
+        // With no damage Smithay skipped the draw, so forward the Android
+        // dependency itself. No Linux writes or new fence are needed.
         let force_sync = niri
             .config
             .borrow()
             .debug
             .wait_for_frame_completion_before_queueing;
-        let fence = if !force_sync && sync.is_exportable() {
+        let fence = if gpu_staging && (!drew || !force_sync) {
+            let fence = if drew { sync.export() } else { release.as_ref().and_then(|f| f.export().ok()) };
+            if (drew || release.is_some()) && fence.is_none() {
+                warn!("anland: GPU staging fence export failed; retiring slot");
+                self.client.drop_session();
+                self.on_session_lost(niri);
+                return RenderResult::Skipped;
+            }
+            fence
+        } else if !force_sync && sync.is_exportable() {
             sync.export()
         } else {
             None
         };
-        if fence.is_none() {
+        if fence.is_none() && (!gpu_staging || (drew && force_sync)) {
             let _span = tracy_client::span!("wait for completion");
             if let Err(err) = sync.wait() {
                 warn!("anland: render fence wait failed: {err}");
@@ -1091,6 +1162,7 @@ impl Anland {
                 return RenderResult::Skipped;
             }
         }
+        let sent_after = get_monotonic_time();
         let commit_id = match self.client.submit(generation, index, fence.as_ref()) {
             Ok(id) => id,
             Err(err) => {
@@ -1105,12 +1177,14 @@ impl Anland {
             self.on_session_lost(niri);
             return RenderResult::Skipped;
         }
-        // Collect presentation feedback and complete it when the consumer signals
-        // buffer-ready.
-        self.pending_feedback = Some(niri.take_presentation_feedbacks(output, &states));
+        let feedback = niri.take_presentation_feedbacks(output, &states);
+        if !self.presentation_reports.submitted(commit_id, sent_after, feedback) {
+            self.client.drop_session();
+            self.on_session_lost(niri);
+            return RenderResult::Skipped;
+        }
 
-
-        // Mark the frame as in flight. Buffer-ready completes it.
+        // Buffer-ready releases transport back-pressure. Feedback does not.
         let output_state = niri.output_state.get_mut(output).unwrap();
         match mem::replace(
             &mut output_state.redraw_state,

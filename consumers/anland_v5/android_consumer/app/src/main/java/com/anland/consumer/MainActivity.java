@@ -281,8 +281,8 @@ public class MainActivity extends Activity
         // CameraServices; the last two only declare their natives.
         System.loadLibrary("anland_consumer");
     }
-    // Forwards the current display refresh rate to the daemon so KWin can repace
-    // its RenderLoop. Re-fires on every onDisplayChanged (e.g. 60/90/120 switch).
+    // Forward the cadence Android gives this window, including app rate overrides.
+    // Observing it must not vote for a different Android display mode.
     private final DisplayManager.DisplayListener displayListener =
         new DisplayManager.DisplayListener() {
             @Override public void onDisplayAdded(int displayId) {}
@@ -364,8 +364,8 @@ public class MainActivity extends Activity
     }
 
     private void pushRefreshRate() {
-        Display d = getDisplay();
-        if (d != null)
+        Display d = surfaceView == null ? null : surfaceView.getDisplay();
+        if (d != null && mNative != null)
             mNative.setRefreshRate(d.getRefreshRate());
     }
 
@@ -476,8 +476,8 @@ public class MainActivity extends Activity
         connectedW = 0;
         connectedH = 0;
         applyConnectionConfig();
-        startNative(surface);
         pushRefreshRate();
+        startNative(surface);
         applyMicState();
         applyAudioLatency();
         applyAudioKeepalive();
@@ -683,7 +683,6 @@ public class MainActivity extends Activity
         super.onCreate(savedInstanceState);
 
         setupMediaAudio();
-        applyOrientation();
 
         // Apply the launch parameters: socket path (overrides the saved pref) and
         // window name (task title). Read them before anything else so the dedup
@@ -723,6 +722,9 @@ public class MainActivity extends Activity
             startActivity(new Intent(this, SettingsActivity.class));
             return;
         }
+
+        // Only the window that will own a SurfaceView may request a rotation.
+        applyOrientation();
 
         sInstance = this;
 
@@ -1848,18 +1850,18 @@ public class MainActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        // Duplicate launches and missing sockets can finish before constructing
+        // a native instance or a view hierarchy.
+        if (mNative == null || isFinishing()) {
+            if (mForceSettings) finish();
+            return;
+        }
+
         mResumed = true;
         // Cached while the screen is up: the immersive routing must never read
         // shared preferences from an evdev frame.
         immersiveHudTouch = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .getBoolean(ImmersiveMode.KEY_HUD_TOUCH, ImmersiveMode.DEFAULT_HUD_TOUCH);
-
-        // Bounced to Settings from onCreate (socket missing): nothing was set up, so
-        // just exit this window instead of running the connect logic.
-        if (mForceSettings) {
-            finish();
-            return;
-        }
 
         tabletInputManager = getSystemService(InputManager.class);
         if (tabletInputManager != null && !tabletDeviceListenerRegistered) {
@@ -1906,8 +1908,17 @@ public class MainActivity extends Activity
 
         setupFullscreen();
         DisplayManager dm = getSystemService(DisplayManager.class);
-        if (dm != null)
-            dm.registerDisplayListener(displayListener, null);
+        if (dm != null) {
+            if (Build.VERSION.SDK_INT >= 36) {
+                dm.registerDisplayListener(getMainExecutor(),
+                        DisplayManager.EVENT_TYPE_DISPLAY_CHANGED
+                                | DisplayManager.EVENT_TYPE_DISPLAY_REFRESH_RATE,
+                        displayListener);
+            } else {
+                dm.registerDisplayListener(displayListener, lifecycleHandler);
+            }
+        }
+        pushRefreshRate();
         updateDisplayRotation();
         // Bring the camera service up (or confirm it disabled) BEFORE nativeStart, so
         // the render thread's do_connect() sees a settled camera_service_is_ready()
@@ -1926,7 +1937,6 @@ public class MainActivity extends Activity
                 cancelPendingReconnect();
                 reconnectNow(surfaceView.getHolder().getSurface());
             }
-            pushRefreshRate();
             applyMicState();
             applyAudioLatency();
             applyAudioKeepalive();
@@ -2189,8 +2199,6 @@ public class MainActivity extends Activity
                 }
             });
             mRoot.postDelayed(this::syncScreenSizeToSurface, 400L);
-        } else {
-            relayout();
         }
     }
 
@@ -2249,6 +2257,9 @@ public class MainActivity extends Activity
     // Floating mode: the soft keyboard overlays the display, so the surface
     // keeps its full size (target 0). Default mode: shrink it above the IME.
     private void relayout() {
+        if (surfaceView == null)
+            return;
+
         int target = mKeyboardFloating ? 0 : mImeBottom;
 
         FrameLayout.LayoutParams lp =

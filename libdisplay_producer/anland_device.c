@@ -38,12 +38,21 @@
  * packed InputEvent so poll_input() can hand events through verbatim. */
 _Static_assert(sizeof(anland_device_input_t) == sizeof(struct InputEvent),
                "anland_device_input_t must stay layout-compatible with InputEvent");
+_Static_assert(sizeof(struct InputEvent) == 20 && _Alignof(anland_device_input_t) == 4,
+               "Anland v5 input size and device input ABI alignment are fixed");
+_Static_assert(ANLAND_DEVICE_IN_FRAME_PRESENTATION == INPUT_TYPE_FRAME_PRESENTATION &&
+               offsetof(anland_device_input_t, frame_presentation.serial) == 4 &&
+               offsetof(struct InputEvent, frame_presentation.serial) == 4 &&
+               offsetof(anland_device_input_t, frame_presentation.presentation_ns) == 12 &&
+               offsetof(struct InputEvent, frame_presentation.presentation_ns) == 12,
+               "Presentation report offsets must match in the device and wire ABIs");
 
 struct anland_device {
     display_ctx *ctx;        /* owned transport context */
     bool deferred;
     uint32_t     format;     /* screen_info.format (1 = ABGR8888) */
     int          pending_fb; /* committed fb index for the next pageflip */
+    bool allow_gpu_staging;
     char         socket_path[108]; /* resolved daemon socket (for diagnostics) */
     anland_device_fallback_cb fallback_cb;
     void *fallback_userdata;
@@ -148,6 +157,30 @@ int anland_device_poll_buffer_ready(anland_device *dev, int timeout_ms)
 {
     return poll_buffer_ready(dev ? dev->ctx : NULL, timeout_ms);
 }
+
+int anland_device_read_buffer_ready(anland_device *dev)
+{
+    return read_buffer_ready(dev ? dev->ctx : NULL);
+}
+
+void anland_device_allow_gpu_staging(anland_device *dev)
+{
+    if (dev) {
+        dev->allow_gpu_staging = true;
+        allow_gpu_staging(dev->ctx, true);
+    }
+}
+
+bool anland_device_uses_gpu_staging(const anland_device *dev)
+{
+    return dev && uses_gpu_staging(dev->ctx);
+}
+
+int anland_device_take_slot_fence(anland_device *dev)
+{
+    return dev ? take_slot_fence(dev->ctx) : -2;
+}
+
 int anland_device_connect(anland_device *dev)
 {
     if (!dev)
@@ -195,6 +228,7 @@ int anland_device_reopen(anland_device *dev, const char *socket_path)
 
     disconnect(dev->ctx);
     dev->ctx = ctx;
+    allow_gpu_staging(ctx, dev->allow_gpu_staging);
     dev->pending_fb = -1;
     snprintf(dev->socket_path, sizeof(dev->socket_path), "%s", path ? path : "");
 
@@ -399,8 +433,7 @@ bool anland_device_notify_frame_done(anland_device *dev)
 
     /* In fallback trigger_refresh() reports success after dropping the stashed
      * fence, because "no consumer" is not an error for the write path. A
-     * compositor needs the opposite answer: the frame did NOT reach the consumer,
-     * so it must fail the frame instead of claiming it was presented. */
+     * compositor needs the opposite answer: the frame was NOT handed off. */
     if (!anland_device_is_connected(dev))
     {
         trigger_refresh(dev->ctx);

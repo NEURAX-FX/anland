@@ -24,8 +24,11 @@
  * nativeLibraryDir with execute permission.
  */
 #include <android/log.h>
+#include <errno.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "socket_utils.h"
@@ -62,6 +65,15 @@ int main(int argc, char **argv)
     int dfd = connect_unix(daemon_sock);
     if (dfd < 0) {
         LOGE("connect to daemon socket '%s' failed", daemon_sock);
+        return 2;
+    }
+
+    /* Set this while we still own the root-created socket. Android permits
+     * the app to send on the handed-off FD but can deny setsockopt there. */
+    const struct timeval timeout = { .tv_usec = 100000 };
+    if (setsockopt(dfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        LOGE("set daemon socket send timeout failed: %s", strerror(errno));
+        close(dfd);
         return 2;
     }
 

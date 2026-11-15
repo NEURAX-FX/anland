@@ -23,11 +23,13 @@
  * the legacy path unable to report real presentation:
  *
  *   1. SUBMITTED  — anland_scene_commit_submit() accepted the transaction
- *   2. PRESENTED  — the backend reports the frame was acknowledged by the
- *      consumer (legacy: buffer rotation; not proof of physical scanout)
- *   3. RELEASED   — a buffer may be reused by the producer again
+ *   2. CONSUMED   — the legacy transport completed its handshake for this frame
+ *                   (not evidence of presentation)
+ *   3. PRESENTED  — the backend reports real display presentation, if available
+ *   4. RELEASED   — a buffer may be reused by the producer again
  *
- * A successful submit says nothing about (2) or (3).
+ * These are separate facts; legacy display feedback can arrive independently
+ * of consumption, and may be unavailable.
  *
  * fd ownership (applies to every fd in this API):
  *   - fds passed IN  (acquire_fence_fd) are BORROWED. The caller keeps ownership
@@ -118,16 +120,11 @@ typedef struct anland_layer_state {
 /* ---- events (backend → DE) ---- */
 
 typedef enum anland_scene_event_type {
-    /* The consumer has ACKNOWLEDGED this commit (it selected the next buffer /
-     * requested more work). On the legacy transport this is the strongest signal
-     * available; it does NOT prove the buffer was physically scanned out, so it
-     * is deliberately named "presented" only by historical convention. A future
-     * backend with real display feedback can report a stronger timestamp.
-     *
-     * DELIBERATELY NOT equivalent to BUFFER_RELEASED: a device may still scan out
-     * or asynchronously composite the buffer it just acknowledged. The backend
-     * owns the lifetime decision and reports it separately through
-     * anland_scene_backend_release_buffer(). */
+    /* The backend reports display presentation. Does not imply buffer reuse;
+     * the backend reports that separately via anland_scene_backend_release_buffer().
+     * For compatibility the legacy adapter uses this with a zero timestamp
+     * for transport acknowledgements by default. Opt-in DEs get FRAME_CONSUMED
+     * instead, with optional display feedback separately on the data channel. */
     ANLAND_SCENE_EVENT_PRESENTED = 1,
     /* The buffer is no longer referenced by any in-flight commit and may be
      * reused by the producer. Reported ONLY when the backend explicitly says so
@@ -146,10 +143,12 @@ typedef enum anland_scene_event_type {
      * This is a RENDER TARGET signal, not a completion signal: it says "you may
      * draw into buffer_id now", and it is what starts (or resumes) a DE's frame
      * loop. It is deliberately separate from PRESENTED, because the handshake
-     * publishes a selection before any frame has ever been flipped — treating
-     * that first signal as a presentation would report a frame that never
-     * existed. Emitted on connect and again after each acknowledgement. */
+     * publishes a selection before any frame has ever been flipped. Emitted on
+     * connect and again after each frame is consumed. */
     ANLAND_SCENE_EVENT_RENDER_TARGET_READY = 5,
+    /* The legacy lockstep consumer requested its next target after handoff.
+     * Completes the commit for pacing only. No timestamp or reuse permission. */
+    ANLAND_SCENE_EVENT_FRAME_CONSUMED = 6,
 } anland_scene_event_type_t;
 
 typedef enum anland_scene_drop_reason {
@@ -242,6 +241,10 @@ anland_scene *anland_scene_create(const anland_scene_backend_ops_t *ops,
                                   void *userdata);
 void anland_scene_destroy(anland_scene *scene);
 
+/* Call before submitting any commits to receive FRAME_CONSUMED for legacy
+ * acknowledgements instead of the historical PRESENTED with timestamp 0. */
+void anland_scene_enable_frame_consumed(anland_scene *scene);
+
 /* Reconnect / teardown: any in-flight commit is dropped (the DE receives
  * COMMIT_DROPPED; unhanded buffers are released immediately) and the generation is bumped
  * so a backend holding stale work discards it. Layers survive: their identity is
@@ -287,8 +290,8 @@ int anland_scene_layer_count(const anland_scene *scene);
  * partially-applied transaction can never be observed. Returns 0 on success and
  * writes the commit id to *out_commit_id (may be NULL).
  *
- * This only means the transaction was ACCEPTED. Presentation is reported later
- * through the event queue. */
+ * This only means the transaction was ACCEPTED. The commit's outcome is
+ * reported later through the event queue. */
 int anland_scene_commit_submit(anland_scene *scene,
                                const anland_layer_state_t *states,
                                size_t count,
@@ -301,11 +304,14 @@ int anland_scene_commit_submit(anland_scene *scene,
  * with submit/present/cancellation by the adapter caller. */
 int anland_scene_backend_handed_off(anland_scene *scene, uint64_t commit_id);
 
-/* The consumer acknowledged the frame (legacy: buffer rotation; not proof of
- * physical scanout — see the event enum comment). Completes the in-flight commit
- * ONLY. The backend reports buffer release separately when reuse is safe. */
+/* Report display presentation and complete an in-flight commit. The backend
+ * reports buffer release separately when reuse is safe. */
 int anland_scene_backend_presented(anland_scene *scene, uint64_t commit_id,
                                    uint64_t presentation_ns);
+
+/* Complete a commit for legacy transport pacing only. Emits FRAME_CONSUMED
+ * when enabled, or the historical zero-timestamp PRESENTED otherwise. */
+int anland_scene_backend_consumed(anland_scene *scene, uint64_t commit_id);
 
 /* The backend could not present the commit (GPU error, surface lost...). */
 int anland_scene_backend_dropped(anland_scene *scene, uint64_t commit_id,

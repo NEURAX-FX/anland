@@ -20,6 +20,17 @@
 
 #define MAX_BUFS 8
 
+/* The v5 fence socket is SOCK_STREAM for legacy consumers. A consumer
+ * offering GPU staging uses SOCK_SEQPACKET instead. Only an opted-in producer
+ * sends GPU_READY, before either side sends any frame messages. GPU mode
+ * replaces the buffer-ready eventfd with the reverse fence channel. */
+enum display_fence_marker {
+    DISPLAY_FENCE_RENDER_DONE = 0, /* producer -> consumer, optional SYNC_FD */
+    DISPLAY_FENCE_GPU_READY,      /* producer -> consumer, no FD */
+    DISPLAY_FENCE_SLOT_READY,     /* consumer -> producer, no FD (complete) */
+    DISPLAY_FENCE_SLOT_RELEASE,   /* consumer -> producer, exactly one SYNC_FD */
+};
+
 struct ctrl_msg {
     uint32_t type;
     uint32_t size;
@@ -76,6 +87,11 @@ struct buf_info {
 #define INPUT_TYPE_TABLET_POSITION 14
 #define INPUT_TYPE_TABLET_TILT     15
 #define INPUT_TYPE_TABLET_FRAME    16
+
+/* Successful swap feedback, carried independently of target-ready. Serial 1
+ * identifies the first render completion sent/received on these channels;
+ * failed swaps still consume their completion serials. */
+#define INPUT_TYPE_FRAME_PRESENTATION 17
 
 #define TABLET_TOOL_PEN    1
 #define TABLET_TOOL_ERASER 2
@@ -154,6 +170,10 @@ struct InputEvent {
         struct {
             uint32_t tool_id, flags, buttons, time_msec;
         } tablet_frame;
+        struct {
+            uint64_t serial;
+            uint64_t presentation_ns; /* EGL DISPLAY_PRESENT, CLOCK_MONOTONIC; 0 if unavailable */
+        } __attribute__((packed)) frame_presentation;
         struct {
             uint32_t padding[4];
         };

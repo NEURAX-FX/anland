@@ -3,6 +3,7 @@
 #include "../common/socket_utils.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -11,64 +12,33 @@
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
+
+enum session_state { WAITING_READY, ACTIVE, DEAD };
 
 struct display_ctx {
     int      ctrl_fd;
     int      data_fd;
     int      buf_ready_efd;
-    int      fence_fd;        /* read end of the dedicated render-done fence channel */
+    int      fence_fd;        /* render completion; bidirectional in GPU mode */
     int      shm_fd;
     int      audio_fd;        /* local end of the bidirectional audio socketpair (hello slot 4) */
     volatile uint32_t *shm_ptr;
-    uint32_t screen_w, screen_h;
-    uint32_t pixel_format;
-    bool     fallback;
-    bool     buffer_pending;
+    _Atomic enum session_state state;
 
-    /* The display lib is called concurrently: the render thread (select_dmabuf /
-     * refresh_done / push_dmabufs), the event thread (poll_output_event /
-     * handle_resource_request) and JNI input threads (push_input_event*). Two locks
-     * with a fixed order (state_lock -> data_lock) tame the resulting races:
-     *   - state_lock guards `fallback`, every fd field, `shm_ptr` and `buffer_pending`
-     *     (i.e. the whole connection lifecycle mutated by enter_fallback).
-     *   - data_lock serialises concurrent WRITES to data_fd.
-     * Invariant: never call enter_fallback() or a user callback while holding either
-     * lock (they re-acquire / re-enter). */
-    pthread_mutex_t state_lock;
-    pthread_mutex_t data_lock;
-
-    /* Hot-path gate: data_fd writes only need data_lock while the producer may still
-     * request service fds (the two-part push_input_event_with_fds send is the only
-     * writer that can interleave with input events). Once every registered service's
-     * fds have gone out, no fd-carrying writer remains and input events go lockless.
-     * Monotonic true->false per session; a stale `true` read just takes a harmless
-     * extra lock, a `false` read is only reachable after the last fd write finished. */
-    volatile bool data_needs_lock;
-    uint32_t      services_sent_mask;
-
-    int              stored_fds[MAX_BUFS];
-    struct buf_info  stored_infos[MAX_BUFS];
-    int              stored_count;
-
-    void (*fallback_cb)(void *);
-    void (*exit_fallback_cb)(void *);
-    void  *fallback_userdata;
-    void  *exit_fallback_userdata;
+    /* Render-thread only. The fds themselves stay immutable until disconnect,
+     * after all users have stopped. Abort only shuts the sockets down. */
+    unsigned char ready_bytes[sizeof(struct ctrl_msg)];
+    size_t ready_used;
+    int buf_count;
+    bool gpu_offer, gpu_ready;
+    enum { SLOT_IDLE, SLOT_IN_FLIGHT, SLOT_COMPLETE } slot;
+    pthread_mutex_t data_lock; /* serializes writes, including service fd packets */
     struct service_info *services;
     int             num_services;
     struct resources *resources;
 };
-
-/* (Re)arm the data_fd write gate for a fresh connected session: writers take
- * data_lock until every service's fds have been sent. Callers either hold data_lock
- * (enter_fallback) or run single-threaded at (re)connect (allocate_services,
- * try_exit_fallback), so this needs no locking of its own. */
-static void arm_data_lock(struct display_ctx *ctx)
-{
-    ctx->services_sent_mask = 0;
-    ctx->data_needs_lock = (ctx->num_services > 0);
-}
 
 void allocate_services(struct display_ctx *ctx, struct service_info *services, int num_services){
     ctx->services = services;
@@ -84,7 +54,6 @@ void allocate_services(struct display_ctx *ctx, struct service_info *services, i
         ctx->resources[i].num = 0;
         ctx->resources[i].fds = NULL;
     }
-    arm_data_lock(ctx);
 }
 void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event, int* fds, int fd_count);
 void handle_resource_request(struct display_ctx *ctx, struct OutputEvent *event){
@@ -113,17 +82,6 @@ void handle_resource_request(struct display_ctx *ctx, struct OutputEvent *event)
     input_event.resource.fdnum = ctx->resources[i].num;
     push_input_event_with_fds(ctx, &input_event, ctx->resources[i].fds, ctx->resources[i].num);
 
-    /* This service's fds are out. Once every service has been sent, no fd-carrying
-     * writer remains, so drop the data_fd write lock (input goes lockless). Update
-     * under data_lock so the flip-to-false lands after the fd send released it. */
-    if (!ctx->fallback && ctx->num_services > 0 && ctx->num_services < 32) {
-        pthread_mutex_lock(&ctx->data_lock);
-        ctx->services_sent_mask |= (1u << i);
-        uint32_t all = (1u << ctx->num_services) - 1u;
-        if ((ctx->services_sent_mask & all) == all)
-            ctx->data_needs_lock = false;
-        pthread_mutex_unlock(&ctx->data_lock);
-    }
 }
 void free_resources(struct display_ctx *ctx){//释放资源，保留服务信息
     for(int i=0;i<ctx->num_services;i++){
@@ -161,15 +119,15 @@ static int send_hello_fds(display_ctx *ctx)
 {
     /* Three dedicated socketpairs:
      *   - data:  consumer->producer input/bufs (reverse direction reserved for future)
-     *   - fence: producer->consumer render-done messages; the message itself is the
-     *            "frame rendered" signal (no separate eventfd, no cross-channel ordering).
+     *   - fence: frame completion, and in negotiated GPU mode, slot release.
+     *            SOCK_SEQPACKET advertises GPU mode without changing HELLO.
      *   - audio: full-duplex PCM -- producer writes playback, consumer writes mic.
      * We keep one end of each and hand the other to the producer. The fd slot order
      * must match the producer's pickup_fds(): { buf_ready, fence, data, shm, audio }. */
     int sv[2], fv[2], av[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
         return -1;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fv) < 0) {
+    if (socketpair(AF_UNIX, ctx->gpu_offer ? SOCK_SEQPACKET : SOCK_STREAM, 0, fv) < 0) {
         close(sv[0]);
         close(sv[1]);
         return -1;
@@ -196,115 +154,87 @@ static int send_hello_fds(display_ctx *ctx)
     return ret;
 }
 
-static void enter_fallback(display_ctx *ctx);
-
-static int push_dmabufs_internal(display_ctx *ctx)
+void abort_display_session(display_ctx *ctx)
 {
-    if (ctx->stored_count <= 0)
-        return 0;
+    if (!ctx || atomic_exchange(&ctx->state, DEAD) == DEAD)
+        return;
+    shutdown(ctx->ctrl_fd, SHUT_RDWR);
+    shutdown(ctx->data_fd, SHUT_RDWR);
+    shutdown(ctx->fence_fd, SHUT_RDWR);
+    shutdown(ctx->audio_fd, SHUT_RDWR);
+}
 
-    struct data_msg dhdr = {
-        .type = DATA_MSG_BUFS_READY,
-        .size = ctx->stored_count * sizeof(struct buf_info),
-    };
-    if (send_fds(ctx->data_fd, &dhdr, sizeof(dhdr),
-                 ctx->stored_fds, ctx->stored_count) < 0) {
-        enter_fallback(ctx);
+/* FDS_READY can arrive in fragments on the control stream. Only the initial
+ * handshake is retryable. Never send another HELLO or pool from this ctx. */
+static int wait_for_ready(display_ctx *ctx)
+{
+    while (ctx->ready_used < sizeof(ctx->ready_bytes)) {
+        struct iovec iov = {
+            .iov_base = ctx->ready_bytes + ctx->ready_used,
+            .iov_len = sizeof(ctx->ready_bytes) - ctx->ready_used,
+        };
+        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+        ssize_t n = recvmsg(ctx->ctrl_fd, &msg, MSG_DONTWAIT);
+        if (n >= 0 && (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+            abort_display_session(ctx);
+            errno = EPROTO;
+            return -1;
+        }
+        if (n > 0) {
+            ctx->ready_used += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            errno = EAGAIN;
+            return -1;
+        }
+        abort_display_session(ctx);
+        errno = EPIPE;
         return -1;
     }
-    if (send_all(ctx->data_fd, ctx->stored_infos,
-                 ctx->stored_count * sizeof(struct buf_info)) < 0) {
-        enter_fallback(ctx);
+    struct ctrl_msg ready;
+    memcpy(&ready, ctx->ready_bytes, sizeof(ready));
+    if (ready.type != CTRL_MSG_FDS_READY || ready.size != 0) {
+        abort_display_session(ctx);
+        errno = EPROTO;
+        return -1;
+    }
+    enum session_state expected = WAITING_READY;
+    if (!atomic_compare_exchange_strong(&ctx->state, &expected, ACTIVE)) {
+        errno = EPIPE;
         return -1;
     }
     return 0;
 }
 
-/* Self-contained fallback->active transition: safe to call from any thread/site (the
- * state flip is under state_lock; only one caller wins). Currently driven by the
- * render thread via select_dmabuf, but the locking keeps future call sites correct. */
-static bool try_exit_fallback(display_ctx *ctx)
+static int active_or_abort(display_ctx *ctx)
 {
-    if (!ctx->fallback)
-        return false;
-
-    struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
-    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
-        return false;
-
-    struct ctrl_msg hdr;
-    if (recv_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) != 0 ||
-        hdr.type != CTRL_MSG_FDS_READY)
-        return false;
-
-    /* Publish the up-transition under state_lock so a concurrent enter_fallback (or a
-     * future try_exit_fallback from another site) sees a consistent fallback/arm state.
-     * The event thread is stopped while in fallback and only restarts in
-     * exit_fallback_cb below, so no handle_resource_request races the re-arm. */
-    pthread_mutex_lock(&ctx->state_lock);
-    bool won = ctx->fallback;
-    if (won) {
-        ctx->fallback = false;
-        arm_data_lock(ctx);
-    }
-    pthread_mutex_unlock(&ctx->state_lock);
-    if (!won)
-        return false;
-
-    push_dmabufs_internal(ctx);   /* outside the lock: may enter_fallback on failure */
-    if (ctx->exit_fallback_cb)
-        ctx->exit_fallback_cb(ctx->exit_fallback_userdata);
-    return true;
+    /* Once active, even readable control bytes are unexpected: this channel
+     * has no further daemon messages for a consumer. */
+    struct pollfd ctrl = { .fd = ctx->ctrl_fd, .events = POLLIN };
+    int ret = poll(&ctrl, 1, 0);
+    if (ctx->state == ACTIVE && (ret == 0 || (ret < 0 && errno == EINTR)))
+        return 0;
+    abort_display_session(ctx);
+    errno = EPIPE;
+    return -1;
 }
 
-static void enter_fallback(display_ctx *ctx)
+static int set_write_timeout(int fd)
 {
-    /* Atomic test-and-set of `fallback` so two threads (render timeout + event/input
-     * send failure) can't both tear the connection down (double close/munmap/cb). */
-    pthread_mutex_lock(&ctx->state_lock);
-    if (ctx->fallback) {
-        pthread_mutex_unlock(&ctx->state_lock);
-        return;
-    }
-    ctx->fallback = true;          /* set first: lockless hot-path writers bail early */
-    free_resources(ctx);
-    ctx->buffer_pending = false;
-
-    /* Fence out data_fd writers while the fds are closed and replaced. Null each
-     * pointer/fd before closing so a racing lockless writer reads -1 / NULL and fails
-     * benignly (EBADF) rather than writing into a reused fd. */
-    pthread_mutex_lock(&ctx->data_lock);
-    if (ctx->data_fd >= 0)         { int fd = ctx->data_fd; ctx->data_fd = -1; close(fd); }
-    if (ctx->buf_ready_efd >= 0)   { close(ctx->buf_ready_efd);   ctx->buf_ready_efd = -1; }
-    if (ctx->fence_fd >= 0)        { close(ctx->fence_fd);        ctx->fence_fd = -1; }
-    if (ctx->audio_fd >= 0)        { close(ctx->audio_fd);        ctx->audio_fd = -1; }
-    if (ctx->shm_ptr) { volatile uint32_t *p = ctx->shm_ptr; ctx->shm_ptr = NULL; munmap((void *)p, sizeof(uint32_t)); }
-    if (ctx->shm_fd >= 0)         { close(ctx->shm_fd);           ctx->shm_fd = -1; }
-
-    /* buf_ready_efd stays an eventfd (consumer->producer pacing signal); fence_fd is
-     * (re)created as a socketpair inside send_hello_fds(). */
-    ctx->buf_ready_efd = eventfd(0, EFD_CLOEXEC);
-    bool shm_ok = (create_shm(ctx) == 0);
-    if (shm_ok)
-        send_hello_fds(ctx);
-    arm_data_lock(ctx);
-    pthread_mutex_unlock(&ctx->data_lock);
-    pthread_mutex_unlock(&ctx->state_lock);
-
-    /* User callback (JNI, stops the event thread) runs OUTSIDE both locks. */
-    if (ctx->fallback_cb)
-        ctx->fallback_cb(ctx->fallback_userdata);
+    const struct timeval timeout = { .tv_usec = 100000 };
+    return setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 }
-int connect_to_deamon(display_ctx **out, const char *socket_path){
-    return connect_to_deamon_with_fd(out, connect_unix(socket_path));
-}
-int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
+static int connect_with_fd(display_ctx **out, int ctrl_fd, bool gpu_offer)
 {
+    *out = NULL;
     display_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx)
+    if (!ctx) {
+        if (ctrl_fd >= 0)
+            close(ctrl_fd);
         return -1;
+    }
 
-    pthread_mutex_init(&ctx->state_lock, NULL);
     pthread_mutex_init(&ctx->data_lock, NULL);
 
     ctx->ctrl_fd = -1;
@@ -314,7 +244,8 @@ int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
     ctx->shm_fd = -1;
     ctx->audio_fd = -1;
     ctx->shm_ptr = NULL;
-    ctx->fallback = true;
+    atomic_init(&ctx->state, WAITING_READY);
+    ctx->gpu_offer = gpu_offer;
 
     ctx->ctrl_fd = ctrl_fd;
     if (ctx->ctrl_fd < 0)
@@ -322,7 +253,7 @@ int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
 
     /* buf_ready_efd is the consumer->producer pacing eventfd; fence_fd is created as a
      * socketpair inside send_hello_fds(). */
-    ctx->buf_ready_efd = eventfd(0, EFD_CLOEXEC);
+    ctx->buf_ready_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (ctx->buf_ready_efd < 0)
         goto fail;
 
@@ -330,6 +261,8 @@ int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
         goto fail;
 
     if (send_hello_fds(ctx) < 0)
+        goto fail;
+    if (set_write_timeout(ctx->data_fd) < 0)
         goto fail;
 
     *out = ctx;
@@ -343,10 +276,42 @@ fail:
     if (ctx->buf_ready_efd >= 0)   close(ctx->buf_ready_efd);
     if (ctx->fence_fd >= 0)        close(ctx->fence_fd);
     if (ctx->audio_fd >= 0)        close(ctx->audio_fd);
-    pthread_mutex_destroy(&ctx->state_lock);
     pthread_mutex_destroy(&ctx->data_lock);
     free(ctx);
     return -1;
+}
+
+static int connect_path(display_ctx **out, const char *socket_path, bool gpu_offer)
+{
+    int fd = connect_unix(socket_path);
+    if (fd >= 0 && set_write_timeout(fd) < 0) {
+        int error = errno;
+        close(fd);
+        *out = NULL;
+        errno = error;
+        return -1;
+    }
+    return connect_with_fd(out, fd, gpu_offer);
+}
+
+int connect_to_deamon(display_ctx **out, const char *socket_path)
+{
+    return connect_path(out, socket_path, false);
+}
+
+int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
+{
+    return connect_with_fd(out, ctrl_fd, false);
+}
+
+int connect_to_deamon_gpu(display_ctx **out, const char *socket_path)
+{
+    return connect_path(out, socket_path, true);
+}
+
+int connect_to_deamon_with_fd_gpu(display_ctx **out, int ctrl_fd)
+{
+    return connect_with_fd(out, ctrl_fd, true);
 }
 
 void disconnect(display_ctx *ctx)
@@ -361,115 +326,210 @@ void disconnect(display_ctx *ctx)
     if (ctx->fence_fd >= 0)        close(ctx->fence_fd);
     if (ctx->audio_fd >= 0)        close(ctx->audio_fd);
     free_resources(ctx);
-    pthread_mutex_destroy(&ctx->state_lock);
+    free(ctx->resources);
     pthread_mutex_destroy(&ctx->data_lock);
     free(ctx);
 }
 
 int set_screen_info(display_ctx *ctx, uint32_t width, uint32_t height, uint32_t format, uint32_t refresh)
 {
-    ctx->screen_w = width;
-    ctx->screen_h = height;
-    ctx->pixel_format = format;
+    if (ctx->state == DEAD) {
+        errno = EPIPE;
+        return -1;
+    }
 
     struct ctrl_msg hdr = { .type = CTRL_MSG_SCREEN_INFO, .size = sizeof(struct screen_info) };
     struct screen_info si = { .width = width, .height = height, .format = format, .refresh = refresh };
     uint8_t msg[sizeof(struct ctrl_msg) + sizeof(struct screen_info)];
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), &si, sizeof(si));
-    return send_all(ctx->ctrl_fd, msg, sizeof(msg));
+    if (send_all(ctx->ctrl_fd, msg, sizeof(msg)) == 0)
+        return 0;
+    abort_display_session(ctx);
+    return -1;
 }
 
 int push_dmabufs(display_ctx *ctx, const int *fds, const struct buf_info *infos, int count)
 {
-    if (count > MAX_BUFS) count = MAX_BUFS;
-    memcpy(ctx->stored_fds, fds, count * sizeof(int));
-    memcpy(ctx->stored_infos, infos, count * sizeof(struct buf_info));
-    ctx->stored_count = count;
+    if (ctx->state == DEAD) {
+        errno = EPIPE;
+        return -1;
+    }
+    if (ctx->buf_count) {
+        errno = EALREADY;
+        return -1;
+    }
+    if (count <= 0 || count > MAX_BUFS || !fds || !infos) {
+        errno = EINVAL;
+        return -1;
+    }
 
-    if (ctx->fallback)
-        return 0;
-
-    int ret = push_dmabufs_internal(ctx);
-    enter_fallback(ctx);
-    return ret;
+    const struct data_msg hdr = {
+        .type = DATA_MSG_BUFS_READY,
+        .size = count * sizeof(*infos),
+    };
+    pthread_mutex_lock(&ctx->data_lock);
+    bool sent = send_fds(ctx->data_fd, &hdr, sizeof(hdr), fds, count) == 0 &&
+                send_all(ctx->data_fd, infos, hdr.size) == 0;
+    pthread_mutex_unlock(&ctx->data_lock);
+    if (!sent) {
+        abort_display_session(ctx);
+        return -1;
+    }
+    ctx->buf_count = count;
+    return 0;
 }
 
 int select_dmabuf(display_ctx *ctx, int idx)
 {
-    if (ctx->fallback) {
-        try_exit_fallback(ctx);   /* holds state_lock internally for the transition */
-        if (ctx->fallback)
-            return 0;
-    }
-
-    if (idx < 0 || idx >= ctx->stored_count)
+    if (ctx->gpu_offer) {
+        errno = EPROTONOSUPPORT;
         return -1;
-
+    }
+    if (ctx->state == WAITING_READY && wait_for_ready(ctx) < 0)
+        return -1;
+    if (active_or_abort(ctx) < 0)
+        return -1;
+    if (ctx->slot != SLOT_IDLE || idx < 0 || idx >= ctx->buf_count) {
+        errno = ctx->slot != SLOT_IDLE ? EBUSY : EINVAL;
+        return -1;
+    }
     *ctx->shm_ptr = (uint32_t)idx;
-    eventfd_t val = 1;
-    eventfd_write(ctx->buf_ready_efd, val);
-    ctx->buffer_pending = true;
+    if (eventfd_write(ctx->buf_ready_efd, 1) != 0) {
+        abort_display_session(ctx);
+        errno = EPIPE;
+        return -1;
+    }
+    ctx->slot = SLOT_IN_FLIGHT;
     return 0;
 }
 
-/* Wait for the producer to finish the frame, then return its render-done fence so
- * the caller can hand it to ANativeWindow_queueBuffer (SurfaceFlinger waits on it
- * GPU-side before scanout). The producer sends exactly one message per frame on the
- * dedicated fence channel; the message itself is the "frame rendered" signal (no
- * separate eventfd, no cross-channel ordering) and the optional fence rides as
- * SCM_RIGHTS ancillary data. Returns the fence fd (caller owns it), or -1 if none /
- * on error. */
-int refresh_done(display_ctx *ctx)
+int wait_for_gpu_staging(display_ctx *ctx, int timeout_ms)
 {
-    if (!ctx->buffer_pending)
-        return -1;
-
-    /* Block (with a 5s safety timeout) on the fence channel: the arrival of the
-     * producer's per-frame message is the render-done signal. Timeout / no POLLIN
-     * (producer stalled or gone) -> fall back so the render thread never hangs. */
-    struct pollfd pfd = { .fd = ctx->fence_fd, .events = POLLIN };
-    int ret = poll(&pfd, 1, 5000);
-    if (ret <= 0 || !(pfd.revents & POLLIN)) {
-        enter_fallback(ctx);
+    if (!ctx->gpu_offer) {
+        errno = EINVAL;
         return -1;
     }
-    ctx->buffer_pending = false;
+    if (ctx->gpu_ready)
+        return active_or_abort(ctx);
 
-    int rfence = -1;
-    char b;
-    struct iovec iov = { .iov_base = &b, .iov_len = 1 };
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } cmsg;
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cmsg.buf,
-        .msg_controllen = sizeof(cmsg.buf),
+    struct pollfd channels[] = {
+        {.fd = ctx->ctrl_fd, .events = POLLIN},
+        {.fd = ctx->fence_fd, .events = POLLIN},
     };
-    /* Non-blocking even though poll reported POLLIN: if a concurrent enter_fallback
-     * (from a JNI input thread) swapped fence_fd between the poll and this recvmsg,
-     * we get EAGAIN (n < 0) instead of reading a stale/foreign socket. A clean EOF
-     * (n == 0) means the producer closed the channel -> fall back. No fence in the
-     * message => queue with -1 ("ready now"). */
-    ssize_t n = recvmsg(ctx->fence_fd, &msg, MSG_DONTWAIT);
-    if (n == 0) {
-        enter_fallback(ctx);
+    if (ctx->state == WAITING_READY) {
+        int ready = poll(channels, 1, timeout_ms);
+        if (!ready || (ready < 0 && errno == EINTR)) {
+            errno = EAGAIN;
+            return -1;
+        }
+        if (ready < 0) {
+            abort_display_session(ctx);
+            return -1;
+        }
+        if (wait_for_ready(ctx) < 0)
+            return -1;
+        /* Do not spend a second full timeout on the ACK in this call. */
+        timeout_ms = 0;
+    }
+    int ready = poll(channels, 2, timeout_ms);
+    if (ctx->state != ACTIVE || (ready > 0 && (channels[0].revents ||
+        (channels[1].revents & (POLLHUP | POLLERR | POLLNVAL))))) {
+        abort_display_session(ctx);
+        errno = EPIPE;
         return -1;
     }
-    if (n > 0) {
-        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-        if (c && c->cmsg_type == SCM_RIGHTS)
-            memcpy(&rfence, CMSG_DATA(c), sizeof(int));
+    if (!ready || (ready < 0 && errno == EINTR))
+        return 1;
+    if (ready > 0 && channels[1].revents & POLLIN) {
+        unsigned char marker;
+        int fd;
+        const int received = recv_frame_fence(ctx->fence_fd, &marker, &fd);
+        if (received == 1 && marker == DISPLAY_FENCE_GPU_READY && fd < 0) {
+            ctx->gpu_ready = true;
+            return 0;
+        }
+        if (!received)
+            return 1;
+        if (fd >= 0)
+            close(fd);
     }
-    return rfence;
+    abort_display_session(ctx);
+    errno = EPROTO;
+    return -1;
 }
 
-int push_input_event(display_ctx *ctx, const struct InputEvent *event)
+int select_dmabuf_fenced(display_ctx *ctx, int idx, int release_fd)
 {
-    if (ctx->fallback)
+    if (!ctx->gpu_ready || ctx->buf_count != 1 || idx != 0 || release_fd < -1) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (active_or_abort(ctx) < 0)
+        return -1;
+    if (ctx->slot == SLOT_IN_FLIGHT || (ctx->slot == SLOT_IDLE && release_fd >= 0)) {
+        errno = EBUSY;
+        return -1;
+    }
+    /* GPU mode uses the fence socket itself as the ready notification. The
+     * selected index is always zero and never changes while it is in use. */
+    if (send_frame_fence(ctx->fence_fd, release_fd < 0 ? DISPLAY_FENCE_SLOT_READY :
+                        DISPLAY_FENCE_SLOT_RELEASE, release_fd) < 0) {
+        abort_display_session(ctx);
+        errno = EPIPE;
+        return -1;
+    }
+    ctx->slot = SLOT_IN_FLIGHT;
+    return 0;
+}
+
+int refresh_done(display_ctx *ctx, int timeout_ms)
+{
+    if (ctx->slot != SLOT_IN_FLIGHT || ctx->state != ACTIVE)
+        return DISPLAY_FRAME_FAILED;
+
+    struct pollfd pfd[] = {
+        { .fd = ctx->fence_fd, .events = POLLIN },
+        { .fd = ctx->ctrl_fd, .events = POLLIN },
+    };
+    int ready = poll(pfd, 2, timeout_ms < 0 ? 0 : timeout_ms);
+    if (ctx->state != ACTIVE)
+        return DISPLAY_FRAME_FAILED;
+    if (ready == 0 || (ready < 0 && errno == EINTR))
+        return DISPLAY_FRAME_PENDING;
+    if (ready < 0 || pfd[1].revents || !(pfd[0].revents & POLLIN) ||
+        (pfd[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        abort_display_session(ctx);
+        return DISPLAY_FRAME_FAILED;
+    }
+    unsigned char marker;
+    int fence;
+    const int received = recv_frame_fence(ctx->fence_fd, &marker, &fence);
+    if (!received)
+        return DISPLAY_FRAME_PENDING;
+    const bool complete = received == 1 && marker == DISPLAY_FENCE_RENDER_DONE;
+    if (complete && ctx->state == ACTIVE) {
+        ctx->slot = SLOT_COMPLETE;
+        return fence;
+    }
+
+    if (fence >= 0)
+        close(fence);
+    abort_display_session(ctx);
+    return DISPLAY_FRAME_FAILED;
+}
+
+int release_dmabuf(display_ctx *ctx)
+{
+    if (ctx->gpu_offer || ctx->state != ACTIVE || ctx->slot != SLOT_COMPLETE)
+        return -1;
+    ctx->slot = SLOT_IDLE;
+    return 0;
+}
+
+static int push_input(display_ctx *ctx, const struct InputEvent *event, bool advisory)
+{
+    if (ctx->state != ACTIVE)
         return 0;
 
     struct data_msg hdr = { .type = DATA_MSG_INPUT_EVENT, .size = sizeof(struct InputEvent) };
@@ -477,26 +537,38 @@ int push_input_event(display_ctx *ctx, const struct InputEvent *event)
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), event, sizeof(*event));
 
-    /* While the producer may still request service fds, serialise against the event
-     * thread's two-part fd send (push_input_event_with_fds); once all services are
-     * out, data_needs_lock clears and input goes lock-free (hot path). */
-    bool locked = ctx->data_needs_lock;
-    if (locked)
+    if (advisory) {
+        if (pthread_mutex_trylock(&ctx->data_lock) != 0)
+            return 0;
+    } else {
         pthread_mutex_lock(&ctx->data_lock);
-    int fd = ctx->data_fd;
-    int r = (fd >= 0) ? send_all(fd, msg, sizeof(msg)) : -1;
-    if (locked)
-        pthread_mutex_unlock(&ctx->data_lock);
-
-    if (r < 0) {
-        enter_fallback(ctx);
-        return -1;
     }
-    return 0;
+    ssize_t n = advisory ? send(ctx->data_fd, msg, sizeof(msg), MSG_DONTWAIT | MSG_NOSIGNAL)
+                         : send_all(ctx->data_fd, msg, sizeof(msg));
+    int error = errno;
+    bool sent = advisory ? n == (ssize_t)sizeof(msg) : n == 0;
+    bool dropped = advisory && n < 0 &&
+                   (error == EAGAIN || error == EWOULDBLOCK || error == EINTR);
+    /* A partial send cannot be dropped: the data stream is no longer framed. */
+    if (!sent && !dropped)
+        abort_display_session(ctx);
+    pthread_mutex_unlock(&ctx->data_lock);
+    return sent ? 1 : dropped ? 0 : -1;
 }
+
+int push_input_event(display_ctx *ctx, const struct InputEvent *event)
+{
+    return push_input(ctx, event, false) < 0 ? -1 : 0;
+}
+
+int try_push_input_event(display_ctx *ctx, const struct InputEvent *event)
+{
+    return push_input(ctx, event, true);
+}
+
 int push_input_event_with_length(display_ctx *ctx, const struct InputEvent *event, void* payload, size_t size)
 {
-    if (ctx->fallback)
+    if (ctx->state != ACTIVE)
         return 0;
 
     struct data_msg hdr = { .type = DATA_MSG_INPUT_EVENT, .size = sizeof(struct InputEvent) };
@@ -508,33 +580,27 @@ int push_input_event_with_length(display_ctx *ctx, const struct InputEvent *even
     memcpy(msg + sizeof(hdr), event, sizeof(*event));
     memcpy(msg + sizeof(hdr) + sizeof(struct InputEvent), payload, size);
 
-    bool locked = ctx->data_needs_lock;
-    if (locked)
-        pthread_mutex_lock(&ctx->data_lock);
-    int fd = ctx->data_fd;
-    int r = (fd >= 0) ? send_all(fd, msg, total) : -1;
-    if (locked)
-        pthread_mutex_unlock(&ctx->data_lock);
+    pthread_mutex_lock(&ctx->data_lock);
+    int r = send_all(ctx->data_fd, msg, total);
+    if (r < 0)
+        abort_display_session(ctx);
+    pthread_mutex_unlock(&ctx->data_lock);
 
     free(msg);
-    if (r < 0) {
-        enter_fallback(ctx);
-        return -1;
-    }
-    return 0;
+    return r;
 }
 int poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_ms)
 {
-    if (ctx->fallback)
-        return 0;
+    if (ctx->state != ACTIVE)
+        return -1;
 
     struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
     int ret = poll(&pfd, 1, timeout_ms);
-    if (ret <= 0)
+    if (ret == 0 || (ret < 0 && errno == EINTR))
         return 0;
 
-    if (pfd.revents & (POLLHUP | POLLERR)) {
-        enter_fallback(ctx);
+    if (ret < 0 || pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+        abort_display_session(ctx);
         return -1;
     }
 
@@ -546,13 +612,15 @@ int poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_m
      * header can only mean the stream desynced: fall back rather than leaving
      * bytes wedged in the socket. */
     uint8_t msg_buf[sizeof(struct data_msg) + sizeof(struct OutputEvent)];
-    if (recv_all(ctx->data_fd, msg_buf, sizeof(msg_buf)) < 0)
+    if (recv_all(ctx->data_fd, msg_buf, sizeof(msg_buf)) < 0) {
+        abort_display_session(ctx);
         return -1;
+    }
 
     struct data_msg hdr;
     memcpy(&hdr, msg_buf, sizeof(hdr));
     if (hdr.type != DATA_MSG_OUTPUT_EVENT || hdr.size != sizeof(struct OutputEvent)) {
-        enter_fallback(ctx);
+        abort_display_session(ctx);
         return -1;
     }
 
@@ -561,45 +629,28 @@ int poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_m
 }
 int poll_output_event_extend_data(display_ctx *ctx, void* payload, size_t size, int timeout_ms)
 {
-    if (ctx->fallback)
-        return 0;
+    if (ctx->state != ACTIVE)
+        return -1;
 
     struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
     int ret = poll(&pfd, 1, timeout_ms);
-    if (ret <= 0)
-        return 0;
-
-    if (pfd.revents & (POLLHUP | POLLERR)) {
-        enter_fallback(ctx);
+    if (ret <= 0 || pfd.revents & (POLLHUP | POLLERR | POLLNVAL) ||
+        recv_all(ctx->data_fd, payload, size) < 0) {
+        /* The payload was announced in the previous event; continuing would
+         * parse the rest of it as an unrelated event header. */
+        abort_display_session(ctx);
         return -1;
     }
-    if (recv_all(ctx->data_fd, payload, size) < 0)
-        return -1;
     return 1;
-}
-int set_fallback_callback(display_ctx *ctx, void (*on_fallback)(void *), void *userdata)
-{
-    ctx->fallback_cb = on_fallback;
-    ctx->fallback_userdata = userdata;
-    return 0;
-}
-
-int set_exit_fallback_callback(display_ctx *ctx, void (*on_exit_fallback)(void *), void *userdata)
-{
-    ctx->exit_fallback_cb = on_exit_fallback;
-    ctx->exit_fallback_userdata = userdata;
-    return 0;
 }
 int get_data_fd(display_ctx *ctx)
 {
     return ctx->data_fd;
 }
-/* Current local end of the audio socketpair, or -1 in fallback. The value changes
- * across reconnects (each hello creates a fresh socketpair), so callers must re-fetch
- * it rather than cache it. */
+/* The fd belongs to this session; it is not replaced after a failure. */
 int get_audio_fd(display_ctx *ctx)
 {
-    return ctx->fallback ? -1 : ctx->audio_fd;
+    return ctx->state == ACTIVE ? ctx->audio_fd : -1;
 }
 //用于处理未处理的变长payload事件
 void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event)
@@ -623,13 +674,10 @@ void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event)
 
 void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event, int* fds, int fd_count)
 {
-    if (ctx->fallback)
+    if (ctx->state != ACTIVE)
         return;
 
-    /* This is the ONLY fd-carrying writer, and it is two framed sends (RESOURCE event
-     * + EXTEND_FDS ancillary). Hold data_lock across BOTH so a concurrent input write
-     * can't wedge between them and desync the producer's framed stream. Sent inline
-     * here (not via push_input_event) to avoid re-locking data_lock. */
+    /* Hold data_lock across the RESOURCE event and the EXTEND_FDS packet. */
     struct data_msg hdr = { .type = DATA_MSG_INPUT_EVENT, .size = sizeof(struct InputEvent) };
     uint8_t msg[sizeof(struct data_msg) + sizeof(struct InputEvent)];
     memcpy(msg, &hdr, sizeof(hdr));
@@ -642,8 +690,7 @@ void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event,
         struct data_msg fhdr = { .type = DATA_MSG_INPUT_EXTEND_FDS, .size = 0 };
         ok = send_fds(fd, &fhdr, sizeof(fhdr), fds, fd_count) >= 0;
     }
-    pthread_mutex_unlock(&ctx->data_lock);
-
     if (!ok)
-        enter_fallback(ctx);   /* outside the lock */
+        abort_display_session(ctx);
+    pthread_mutex_unlock(&ctx->data_lock);
 }

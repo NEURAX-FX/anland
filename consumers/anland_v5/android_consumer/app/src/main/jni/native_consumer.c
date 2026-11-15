@@ -7,11 +7,15 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <jni.h>
+#include <linux/sync_file.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -19,20 +23,24 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "anw_hidden.h"
 #include "camera_service.h"
 #include "display_consumer.h"
 #include "native_audio.h"
 #include "protocol.h"
 #include "socket_utils.h"
 #include "tracy_zones.h"
+#include "window_output.h"
 
 #define TAG "Anland"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define PIXEL_FORMAT_RGBA_8888 1
-#define MAX_COLLECT_BUFS 8
+#define FRAME_POLL_MS 16
+#define GPU_ACK_TIMEOUT_NS 1000000000ULL
+#define COMPLETION_TIMEOUT_NS (5ULL * 1000000000ULL)
+#define FENCE_TIMEOUT_NS 1000000000ULL
+#define PRESENTATION_TIMEOUT_NS 250000000ULL
+#define PRESENTATION_CAPACITY 16
 #define PACING_REPORT_INTERVAL_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
 
 struct pacing_sample {
@@ -44,12 +52,28 @@ struct pacing_sample {
 struct consumer_pacing {
     uint64_t interval_start_ns;
     uint64_t producer_waits;
-    uint64_t surface_queued;
-    uint64_t queue_failures;
+    uint64_t swaps;
+    uint64_t swap_failures;
+    uint64_t presented;
+    uint64_t presentation_unavailable;
+    uint64_t imported_fences;
+    uint64_t release_fences;
+    struct pacing_sample gpu_draw;
     struct pacing_sample producer_wait;
-    struct pacing_sample completion_to_queue;
-    struct pacing_sample acquire_fence_wait;
-    struct pacing_sample buffer_reuse;
+    struct pacing_sample upload;
+    struct pacing_sample draw_swap;
+    struct pacing_sample render_fence_wait;
+};
+
+struct pending_presentation {
+    uint64_t serial;
+    uint64_t frame_id;
+    uint64_t deadline_ns;
+};
+
+struct presentation_queue {
+    struct pending_presentation entries[PRESENTATION_CAPACITY];
+    unsigned count;
 };
 
 /* Saved JVM reference for event-thread JNI callbacks. Process-global (the JVM is);
@@ -57,13 +81,6 @@ struct consumer_pacing {
  * per-instance -> consumer_state.clipboard_obj. */
 static JavaVM *g_jvm = NULL;
 
-/* ANativeWindow hidden-API function pointers: loaded once, read-only afterwards, so
- * safe to share across instances. */
-static struct anw_api api;
-static bool api_loaded = false;
-static void on_fallback(void *userdata);
-
-static void on_exit_fallback(void *userdata);
 struct consumer_state {
     pthread_mutex_t lock;
     /* Serialises the producer input stream; tablet frames hold it across their
@@ -72,33 +89,18 @@ struct consumer_state {
     ANativeWindow *window;
     display_ctx *ctx;
     pthread_t render_thread;
-    volatile bool running;
+    _Atomic bool running;
 
-    //Note: it is Deamon's Reconnect, not Fallback Flag
-    //Fallback is maintained by display lib, and the consumer should not care about it.
-    volatile bool need_reconnect;
-
-    int buf_count;
-    int dmabuf_fds[MAX_COLLECT_BUFS];
-    struct buf_info dmabuf_infos[MAX_COLLECT_BUFS];
-    ANativeWindowBuffer *buf_anb[MAX_COLLECT_BUFS];
-    uint64_t buffer_queued_at_ns[MAX_COLLECT_BUFS];
     struct consumer_pacing pacing;
-
-    int screen_w;
-    int screen_h;
 
     // Latest display refresh rate (milli-Hz) reported from Java. Read on
     // (re)connect to seed the producer; updated live by nativeSetRefreshRate.
-    volatile uint32_t refresh_mhz;
+    _Atomic uint32_t refresh_mhz;
 
     // Event (output) thread
     pthread_t event_thread;
-    volatile bool event_running;
-    /* True while event_thread holds a started-but-not-yet-joined thread. stop only
-     * signals (never joins -- on_fallback can run ON the event thread); the join is
-     * deferred to the next start_event_thread() (create time), which runs on the
-     * render thread and so cannot self-join. */
+    _Atomic bool event_running;
+    /* All event-thread start and join operations are owned by the render thread. */
     bool event_thread_joinable;
 
     /* Connection config, set from Java via nativeConfigure() and read on each
@@ -142,9 +144,8 @@ struct consumer_state {
      * nativeClipListening / nativeClipboardSync the event thread calls (per-instance). */
     jobject clipboard_obj;
 
-    /* Owning MainActivity: on_fallback() calls its onFallback() when the display lib
-     * drops the connection, so Java can probe the daemon socket and close the window
-     * if the daemon is gone (per-instance global ref). */
+    /* Owning MainActivity: notified when a display session is lost, so Java can
+     * reset input and probe whether the daemon is still reachable. */
     jobject activity_obj;
 
     /* Per-instance audio bridge (own AAudio streams, own producer). */
@@ -157,9 +158,19 @@ struct consumer_state {
 
 static void topapp_handle_scheduling_event(struct consumer_state *s,
                                            const struct OutputEvent *event);
+static pid_t topapp_discover_root(struct consumer_state *s, int data_fd, bool promote);
 
 static int send_input_event(struct consumer_state *s, const struct InputEvent *event)
 {
+    /* Presentation is advisory: contention or backpressure must not hold up
+     * the render thread or the staging slot. Take both write locks by trylock. */
+    if (event->type == INPUT_TYPE_FRAME_PRESENTATION) {
+        if (pthread_mutex_trylock(&s->input_lock) != 0)
+            return 0;
+        int rc = s->ctx ? try_push_input_event(s->ctx, event) : 0;
+        pthread_mutex_unlock(&s->input_lock);
+        return rc;
+    }
     pthread_mutex_lock(&s->input_lock);
     int rc = s->ctx ? push_input_event(s->ctx, event) : 0;
     pthread_mutex_unlock(&s->input_lock);
@@ -196,12 +207,6 @@ static uint64_t pacing_mean_us(const struct pacing_sample *sample)
     return sample->count ? sample->total_ns / sample->count / 1000ULL : 0;
 }
 
-static void pacing_reset(struct consumer_state *s)
-{
-    memset(&s->pacing, 0, sizeof(s->pacing));
-    memset(s->buffer_queued_at_ns, 0, sizeof(s->buffer_queued_at_ns));
-}
-
 static void pacing_report_if_due(struct consumer_state *s, uint64_t now_ns)
 {
     if (!s->pacing.interval_start_ns || now_ns < s->pacing.interval_start_ns ||
@@ -209,135 +214,121 @@ static void pacing_report_if_due(struct consumer_state *s, uint64_t now_ns)
         return;
 
     const uint64_t elapsed_ns = now_ns - s->pacing.interval_start_ns;
-    const uint64_t queue_fps = elapsed_ns
-        ? s->pacing.surface_queued * 1000000000ULL / elapsed_ns : 0;
-    LOGI("pacing queue_fps=%llu queued=%llu queue_fail=%llu producer_wait=%llu "
+    const uint64_t fps = elapsed_ns ? s->pacing.swaps * 1000000000ULL / elapsed_ns : 0;
+    const uint64_t present_fps = s->pacing.presented * 1000000000ULL / elapsed_ns;
+    LOGI("pacing swap_fps=%llu swapped=%llu swap_fail=%llu producer_wait=%llu "
          "producer_wait_us(avg/max)=%llu/%llu(n=%llu) "
-         "completion_to_queue_us(avg/max)=%llu/%llu(n=%llu) "
-         "acquire_fence_us(avg/max)=%llu/%llu(n=%llu) "
-         "buffer_reuse_us(avg/max)=%llu/%llu(n=%llu)",
-         (unsigned long long)queue_fps,
-         (unsigned long long)s->pacing.surface_queued,
-         (unsigned long long)s->pacing.queue_failures,
+         "display_mhz=%u present_fps=%llu presented=%llu present_unavailable=%llu "
+         "upload_us(avg/max)=%llu/%llu draw_swap_us(avg/max)=%llu/%llu "
+         "render_fence_us(avg/max)=%llu/%llu(n=%llu) "
+         "gpu_draw_us(avg/max)=%llu/%llu(n=%llu) render_sync_fds=%llu release_sync_fds=%llu",
+         (unsigned long long)fps,
+         (unsigned long long)s->pacing.swaps,
+         (unsigned long long)s->pacing.swap_failures,
          (unsigned long long)s->pacing.producer_waits,
          (unsigned long long)pacing_mean_us(&s->pacing.producer_wait),
          (unsigned long long)(s->pacing.producer_wait.worst_ns / 1000ULL),
          (unsigned long long)s->pacing.producer_wait.count,
-         (unsigned long long)pacing_mean_us(&s->pacing.completion_to_queue),
-         (unsigned long long)(s->pacing.completion_to_queue.worst_ns / 1000ULL),
-         (unsigned long long)s->pacing.completion_to_queue.count,
-         (unsigned long long)pacing_mean_us(&s->pacing.acquire_fence_wait),
-         (unsigned long long)(s->pacing.acquire_fence_wait.worst_ns / 1000ULL),
-         (unsigned long long)s->pacing.acquire_fence_wait.count,
-         (unsigned long long)pacing_mean_us(&s->pacing.buffer_reuse),
-         (unsigned long long)(s->pacing.buffer_reuse.worst_ns / 1000ULL),
-         (unsigned long long)s->pacing.buffer_reuse.count);
+         (unsigned)s->refresh_mhz,
+         (unsigned long long)present_fps,
+         (unsigned long long)s->pacing.presented,
+         (unsigned long long)s->pacing.presentation_unavailable,
+         (unsigned long long)pacing_mean_us(&s->pacing.upload),
+         (unsigned long long)(s->pacing.upload.worst_ns / 1000ULL),
+         (unsigned long long)pacing_mean_us(&s->pacing.draw_swap),
+         (unsigned long long)(s->pacing.draw_swap.worst_ns / 1000ULL),
+         (unsigned long long)pacing_mean_us(&s->pacing.render_fence_wait),
+         (unsigned long long)(s->pacing.render_fence_wait.worst_ns / 1000ULL),
+         (unsigned long long)s->pacing.render_fence_wait.count,
+         (unsigned long long)pacing_mean_us(&s->pacing.gpu_draw),
+         (unsigned long long)(s->pacing.gpu_draw.worst_ns / 1000ULL),
+         (unsigned long long)s->pacing.gpu_draw.count,
+         (unsigned long long)s->pacing.imported_fences,
+         (unsigned long long)s->pacing.release_fences);
     memset(&s->pacing, 0, sizeof(s->pacing));
     s->pacing.interval_start_ns = now_ns;
 }
 
-static int queue_surface_buffer(struct consumer_state *s,
-                                ANativeWindowBuffer *buffer, int fence_fd,
-                                int buffer_index, uint64_t completion_ns)
+static void send_presentation(struct consumer_state *s, uint64_t serial, uint64_t ns)
 {
-    const int rc = api.queueBuffer(s->window, buffer, fence_fd);
-    const uint64_t queued_ns = monotonic_now_ns();
-    if (buffer_index >= 0 && buffer_index < s->buf_count)
-        s->buffer_queued_at_ns[buffer_index] = rc == 0 ? queued_ns : 0;
-    if (rc == 0)
-        s->pacing.surface_queued++;
+    if (ns)
+        s->pacing.presented++;
     else
-        s->pacing.queue_failures++;
-    if (completion_ns && queued_ns >= completion_ns)
-        pacing_add(&s->pacing.completion_to_queue, queued_ns - completion_ns);
-    pacing_report_if_due(s, queued_ns);
-    return rc;
+        s->pacing.presentation_unavailable++;
+    const struct InputEvent event = {
+        .type = INPUT_TYPE_FRAME_PRESENTATION,
+        .frame_presentation = { .serial = serial, .presentation_ns = ns },
+    };
+    send_input_event(s, &event);
 }
 
-static int collect_dmabufs(struct consumer_state *s)
+static void poll_presentations(struct consumer_state *s, struct window_output *output,
+                               struct presentation_queue *queue)
 {
-    ANativeWindow *win = s->window;
-    int target = s->buf_count;
-    int found = 0;
-
-    LOGI("collecting %d dma-bufs via dequeue/queue", target);
-
-    for (int attempt = 0; attempt < target * 4 && found < target; attempt++) {
-        ANativeWindowBuffer *anb = NULL;
-        int fence = -1;
-        if (api.dequeueBuffer(win, &anb, &fence) != 0 || !anb) {
-            LOGE("dequeueBuffer failed on attempt %d", attempt);
-            if (fence >= 0)
-                close(fence);
-            break;
-        }
-        if (fence >= 0)
-            close(fence);   /* enumeration only: no need to wait the fence */
-
-        if (!anb->handle || anb->handle->numFds < 1) {
-            LOGE("dequeued buffer has no dma-buf handle on attempt %d", attempt);
-            api.cancelBuffer(win, anb, -1);
+    const uint64_t now = monotonic_now_ns();
+    unsigned keep = 0;
+    for (unsigned i = 0; i < queue->count; ++i) {
+        const struct pending_presentation p = queue->entries[i];
+        uint64_t actual_ns = 0;
+        int rc = window_output_presentation_time(output, p.frame_id, &actual_ns);
+        if (rc == 0 && now && now < p.deadline_ns) {
+            queue->entries[keep++] = p;
             continue;
         }
+        /* Report only Android's actual CLOCK_MONOTONIC timestamp. Expired,
+         * dropped, and unsupported frames have no timestamp (0 on the wire). */
+        send_presentation(s, p.serial, rc == 1 ? actual_ns : 0);
+    }
+    queue->count = keep;
+}
 
-        int fd = anb->handle->data[0];   /* first fd backs the dma-buf */
-        int stride = anb->stride, width = anb->width, height = anb->height;
+static void track_presentation(struct consumer_state *s, struct presentation_queue *queue,
+                                struct window_frame frame, uint64_t serial, uint64_t now)
+{
+    if (!frame.tracked || !now || queue->count == PRESENTATION_CAPACITY) {
+        send_presentation(s, serial, 0);
+        return;
+    }
+    queue->entries[queue->count++] = (struct pending_presentation) {
+        .serial = serial, .frame_id = frame.id, .deadline_ns = now + PRESENTATION_TIMEOUT_NS,
+    };
+}
 
-        /* deduplicate by ANativeWindowBuffer pointer (stable per queue slot) */
-        bool dup_found = false;
-        for (int i = 0; i < found; i++) {
-            if (s->buf_anb[i] == anb) {
-                dup_found = true;
+/* Wait only one slice at a time, both to observe stop and to query Android
+ * presentation timestamps even if the producer has no new frame ready. */
+static bool wait_render_fence(struct consumer_state *s, struct window_output *output,
+                              struct presentation_queue *queue, int fence_fd)
+{
+    const uint64_t start = monotonic_now_ns();
+    struct pollfd fd = { .fd = fence_fd, .events = POLLIN };
+    bool signaled = false;
+    while (s->running) {
+        int rc = poll(&fd, 1, FRAME_POLL_MS);
+        if (rc > 0) {
+            if (!(fd.revents & POLLIN) || (fd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                break;
+            /* An errored dma_fence is also signaled. POLLIN alone does not
+             * establish that the producer's writes completed successfully. */
+            struct sync_file_info info = {0};
+            if (ioctl(fence_fd, SYNC_IOC_FILE_INFO, &info) == 0) {
+                signaled = info.status > 0;
                 break;
             }
+            if (errno != EINTR)
+                break;
         }
-
-        /* post it back so the next dequeue rotates to another slot */
-        api.queueBuffer(win, anb, -1);
-
-        if (dup_found)
-            continue;
-
-        int dup_fd = dup(fd);
-        if (dup_fd < 0)
-            continue;
-
-        s->buf_anb[found] = anb;
-        s->dmabuf_fds[found] = dup_fd;
-        s->dmabuf_infos[found].stride = stride * 4;
-        s->dmabuf_infos[found].width  = width;
-        s->dmabuf_infos[found].height = height;
-        s->dmabuf_infos[found].format = PIXEL_FORMAT_RGBA_8888;
-        s->dmabuf_infos[found].modifier = 0;
-        s->dmabuf_infos[found].offset = 0;
-        LOGI("  buf[%d]: anb=%p fd=%d dup=%d %dx%d stride=%d",
-             found, (void *)anb, fd, dup_fd, width, height, stride);
-        found++;
+        if (rc < 0 && errno != EINTR)
+            break;
+        const uint64_t now = monotonic_now_ns();
+        if (!start || !now || now - start >= FENCE_TIMEOUT_NS)
+            break;
+        poll_presentations(s, output, queue);
     }
-
-    if (found < target) {
-        LOGE("only collected %d/%d", found, target);
-        for (int i = 0; i < found; i++) {
-            close(s->dmabuf_fds[i]);
-            s->dmabuf_fds[i] = -1;
-        }
-        return -1;
-    }
-
-    s->buf_count = found;
-    LOGI("collected %d dma-bufs", found);
-    return 0;
-}
-
-static void cleanup_dmabufs(struct consumer_state *s)
-{
-    for (int i = 0; i < s->buf_count; i++) {
-        if (s->dmabuf_fds[i] >= 0) {
-            close(s->dmabuf_fds[i]);
-            s->dmabuf_fds[i] = -1;
-        }
-    }
-    s->buf_count = 0;
+    close(fence_fd);
+    const uint64_t end = monotonic_now_ns();
+    if (start && end >= start)
+        pacing_add(&s->pacing.render_fence_wait, end - start);
+    return signaled;
 }
 
 /* Report the current display refresh rate to the producer over the data
@@ -345,13 +336,16 @@ static void cleanup_dmabufs(struct consumer_state *s)
  * No-op when disconnected or rate unknown. */
 static void send_refresh_rate(struct consumer_state *s)
 {
-    if (!s->ctx || s->refresh_mhz == 0)
-        return;
-    struct InputEvent ev = {
-        .type = INPUT_TYPE_DISPLAY_REFRESH,
-        .display = { .refresh_mhz = s->refresh_mhz },
-    };
-    send_input_event(s, &ev);
+    pthread_mutex_lock(&s->input_lock);
+    const uint32_t refresh = s->refresh_mhz;
+    if (s->ctx && refresh) {
+        const struct InputEvent ev = {
+            .type = INPUT_TYPE_DISPLAY_REFRESH,
+            .display = { .refresh_mhz = refresh },
+        };
+        push_input_event(s->ctx, &ev);
+    }
+    pthread_mutex_unlock(&s->input_lock);
 }
 
 /*
@@ -378,6 +372,27 @@ static void *event_thread_func(void *arg)
         return NULL;
     }
 
+    /* These may wait on AudioFlinger, su or Android's clipboard service.
+     * Initialize them here, after the render thread has swapped its first frame. */
+    audio_set_ctx(s->audio, s->ctx);
+    audio_start(s->audio);
+    if (s->event_running && s->topapp_run_enable && s->topapp_run_path[0]) {
+        pid_t root = topapp_discover_root(s, get_data_fd(s->ctx), s->topapp_run_mode == 2);
+        if (root > 0) {
+            pthread_mutex_lock(&s->topapp_lock);
+            s->topapp_root_pid = root;
+            pthread_mutex_unlock(&s->topapp_lock);
+        }
+    }
+    if (s->event_running) {
+        jmethodID listen = (*env)->GetMethodID(env, ctxClass, "nativeClipListening", "(Z)V");
+        if (listen)
+            (*env)->CallVoidMethod(env, s->clipboard_obj, listen, JNI_TRUE);
+        jmethodID sync = (*env)->GetMethodID(env, ctxClass, "nativeClipboardSync", "()V");
+        if (sync)
+            (*env)->CallVoidMethod(env, s->clipboard_obj, sync);
+    }
+
     /* CONSUMER_VAR_* callbacks land on the owning MainActivity (var, value). */
     jmethodID setVarMethod = NULL;
     if (s->activity_obj) {
@@ -389,16 +404,13 @@ static void *event_thread_func(void *arg)
     }
 
     while (s->event_running) {
-        if (!s->ctx) {
-            usleep(50000);
-            continue;
-        }
-
         struct OutputEvent ev;
         TracyCZoneN(zPoll, "poll_output_event", 1);
         int ret = poll_output_event(s->ctx, &ev, 500);
         TracyCZoneEnd(zPoll);
-        if (ret <= 0)
+        if (ret < 0)
+            break;
+        if (ret == 0)
             continue;
 
         if (ev.type == OUTPUT_TYPE_RESOURCES_REQUEST) {
@@ -442,8 +454,7 @@ static void *event_thread_func(void *arg)
 
 static void join_event_thread(struct consumer_state *s)
 {
-    /* Idempotent. MUST be called only from a non-event thread (render / JNI teardown);
-     * never from on_fallback (which may run on the event thread). */
+    /* Called from the render thread, after the transport socket was shut down. */
     if (s->event_thread_joinable) {
         pthread_join(s->event_thread, NULL);
         s->event_thread_joinable = false;
@@ -454,9 +465,8 @@ static void start_event_thread(struct consumer_state *s)
 {
     if (s->event_running)
         return;
-    /* Reap the previous stopped-but-unjoined thread before spawning a new one. Runs on
-     * the render thread (on_exit_fallback), so this join can't self-deadlock. */
-    join_event_thread(s);
+    if (s->event_thread_joinable)
+        return;
     s->event_running = true;
     if (pthread_create(&s->event_thread, NULL, event_thread_func, s) == 0)
         s->event_thread_joinable = true;
@@ -464,15 +474,6 @@ static void start_event_thread(struct consumer_state *s)
         s->event_running = false;
 }
 
-static void stop_event_thread(struct consumer_state *s)
-{
-    /* Signal only -- do NOT join here. enter_fallback()->on_fallback() can execute on
-     * the event thread itself, so joining would self-deadlock. The handle stays in
-     * event_thread (event_thread_joinable) and is reaped at create time by the next
-     * start_event_thread() (or do_connect's reconnect path, both on the render
-     * thread). */
-    s->event_running = false;
-}
 
 /*
  * Appends `in` to `out` as one shell word, separated from whatever is already
@@ -513,6 +514,14 @@ static bool append_quoted(char *out, size_t out_size, size_t *used, const char *
     return true;
 }
 
+static void *reap_root_helper(void *arg)
+{
+    const pid_t pid = (pid_t)(intptr_t)arg;
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
+    }
+    return NULL;
+}
+
 /*
  * "Connect with root" handshake. The app cannot connect() to a root-owned
  * daemon socket directly, so it listens on a bridge socket, launches the bundled
@@ -520,93 +529,112 @@ static bool append_quoted(char *out, size_t out_size, size_t *used, const char *
  * passes the connected fd back over the bridge. Returns the received fd (caller
  * owns it) or -1 on failure.
  */
-static int recv_fd_via_root_helper(const char *daemon_sock,
-                                   const char *helper_path,
-                                   const char *bridge_path)
+static int recv_fd_via_root_helper(const struct consumer_state *s, const char *daemon_sock,
+                                   const char *helper_path, const char *bridge_path)
 {
-    if (helper_path[0] == '\0' || bridge_path[0] == '\0') {
-        LOGE("root helper: helper/bridge path not configured");
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    char dir[sizeof(addr.sun_path) - sizeof("/s") + 1];
+    int n = snprintf(dir, sizeof(dir), "%s.XXXXXX", bridge_path);
+    if (!helper_path[0] || !bridge_path[0] || n < 0 || (size_t)n >= sizeof(dir)) {
+        LOGE("root helper: missing configuration or bridge path too long");
         return -1;
     }
-
-    unlink(bridge_path);
-
-    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (lfd < 0) {
-        LOGE("root helper: socket() failed: %s", strerror(errno));
+    /* A concurrent window or late helper from a canceled attempt must never
+     * replace or connect to this attempt's socket. */
+    if (!mkdtemp(dir)) {
+        LOGE("root helper: mkdtemp failed: %s", strerror(errno));
         return -1;
     }
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/s", dir);
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, bridge_path, sizeof(addr.sun_path) - 1);
-
-    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOGE("root helper: bind(%s) failed: %s", bridge_path, strerror(errno));
-        close(lfd);
-        return -1;
-    }
-    /* Root helper runs in a different SELinux/uid context; make the socket file
-     * reachable. (Root bypasses DAC, but be permissive anyway.) */
-    chmod(bridge_path, 0777);
-
-    if (listen(lfd, 1) < 0) {
-        LOGE("root helper: listen() failed: %s", strerror(errno));
-        close(lfd);
-        unlink(bridge_path);
-        return -1;
+    int fd = -1, peer = -1;
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (listener < 0 || bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(listener, 1) < 0) {
+        LOGE("root helper: listen on %s failed: %s", addr.sun_path, strerror(errno));
+        goto out;
     }
 
-    /* Build the command su runs: "<helper> <daemon_sock> <bridge_path>", each
-     * argument quoted so none of them can be read as shell syntax. */
-    char inner[2048];
+    char inner[2048] = {0};
     size_t used = 0;
-    inner[0] = '\0';
-    if (!append_quoted(inner, sizeof(inner), &used, helper_path)
-            || !append_quoted(inner, sizeof(inner), &used, daemon_sock)
-            || !append_quoted(inner, sizeof(inner), &used, bridge_path)) {
+    if (!append_quoted(inner, sizeof(inner), &used, helper_path) ||
+        !append_quoted(inner, sizeof(inner), &used, daemon_sock) ||
+        !append_quoted(inner, sizeof(inner), &used, addr.sun_path)) {
         LOGE("root helper: command line too long to quote safely");
-        close(lfd);
-        unlink(bridge_path);
-        return -1;
+        goto out;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
-        LOGE("root helper: fork() failed: %s", strerror(errno));
-        close(lfd);
-        unlink(bridge_path);
-        return -1;
+        LOGE("root helper: fork failed: %s", strerror(errno));
+        goto out;
     }
     if (pid == 0) {
         execlp("su", "su", "-c", inner, (char *)NULL);
-        _exit(127);   /* su not found / exec failed */
+        _exit(127);
     }
 
-    /* Wait for the helper to connect (root prompt may take a while). */
-    int fd = -1;
-    struct pollfd pfd = { .fd = lfd, .events = POLLIN };
-    if (poll(&pfd, 1, 30000) > 0 && (pfd.revents & POLLIN)) {
-        int cfd = accept(lfd, NULL, NULL);
-        if (cfd >= 0) {
-            char b;
-            int got = 0;
-            if (recv_fds(cfd, &b, 1, &fd, 1, &got) < 0 || got < 1)
-                fd = -1;
-            close(cfd);
-        }
-    } else {
-        LOGE("root helper: timed out waiting for helper connection");
-    }
-
+    /* Preserve time for a root prompt without holding nativeStop's join.
+     * After the child exits, still drain an already queued connection/fd. */
+    const uint64_t deadline = monotonic_now_ns() + 30ULL * 1000000000;
+    pid_t child = 0;
     int status = 0;
-    waitpid(pid, &status, 0);
-    close(lfd);
-    unlink(bridge_path);
+    while (s->running && monotonic_now_ns() < deadline) {
+        struct pollfd pfd = { .fd = peer < 0 ? listener : peer, .events = POLLIN };
+        int ready = poll(&pfd, 1, child == 0 ? 50 : 0);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 || !(pfd.revents & POLLIN)) {
+            if (ready != 0 || child != 0)
+                break;
+            child = waitpid(pid, &status, WNOHANG);
+            if (child < 0 && errno == EINTR)
+                child = 0;
+            continue;
+        }
+        if (peer < 0) {
+            peer = accept4(listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            if (peer < 0 && errno != EINTR && errno != EAGAIN)
+                break;
+        } else {
+            char marker;
+            int count;
+            if (recv_fds(peer, &marker, 1, &fd, 1, &count) == 1 && count == 1) {
+                if (marker == 'F')
+                    break;
+                close(fd);
+            }
+            fd = -1;
+            break;
+        }
+    }
+    if (child == 0) {
+        do {
+            child = waitpid(pid, &status, WNOHANG);
+        } while (child < 0 && errno == EINTR);
+        if (child == 0) {
+            if (fd < 0)
+                kill(pid, SIGKILL);
+            /* su may already be running as root, so even after attempting to
+             * cancel it, reap independently of the window and render thread. */
+            pthread_t reaper;
+            int rc = pthread_create(&reaper, NULL, reap_root_helper, (void *)(intptr_t)pid);
+            if (rc == 0)
+                pthread_detach(reaper);
+            else
+                LOGE("root helper: could not start child reaper: %s", strerror(rc));
+        }
+    }
+    if (fd < 0 && s->running)
+        LOGE("root helper: no daemon fd for %s (su status=%d)", daemon_sock, status);
 
-    if (fd < 0)
-        LOGE("root helper: did not receive daemon fd (su status=%d)", status);
+out:
+    if (peer >= 0)
+        close(peer);
+    if (listener >= 0)
+        close(listener);
+    unlink(addr.sun_path);
+    rmdir(dir);
     return fd;
 }
 
@@ -843,9 +871,9 @@ static void topapp_handle_scheduling_event(struct consumer_state *s,
              settree ? "tree" : "process");
 }
 
-static int do_connect(struct consumer_state *s)
+static int do_connect(struct consumer_state *s, struct window_output **output, bool gpu_staging)
 {
-    pacing_reset(s);
+    memset(&s->pacing, 0, sizeof(s->pacing));
     /* Snapshot the connection config for this attempt. */
     pthread_mutex_lock(&s->cfg_lock);
     bool use_root = s->cfg_use_root;
@@ -860,93 +888,66 @@ static int do_connect(struct consumer_state *s)
     s->topapp_run_mode = s->cfg_topapp_mode == 2 ? 2 : 1;
     memcpy(s->topapp_run_stops, s->cfg_topapp_stops,
            sizeof(s->topapp_run_stops));
-    pthread_mutex_unlock(&s->cfg_lock);
-
-    const char *sock = sock_path;
-
-    /* A boosted producer from the previous session must not keep its top-app
-     * priority across a reconnect cycle; restore the whole tree before the
-     * old ctx dies. */
-    topapp_restore_tree(s);
-
-    if (s->ctx) {
-        audio_set_ctx(s->audio, NULL);   /* detach audio before the old ctx (and its fd) dies */
-        stop_event_thread(s);
-        join_event_thread(s);
-        pthread_mutex_lock(&s->input_lock);
-        disconnect(s->ctx);
-        s->ctx = NULL;
-        pthread_mutex_unlock(&s->input_lock);
-    }
-    cleanup_dmabufs(s);
-
-    ANativeWindow *win = s->window;
-    pthread_mutex_lock(&s->cfg_lock);
     int cw = s->cfg_custom_width;
     int ch = s->cfg_custom_height;
     int sw = s->cfg_screen_width;
     int sh = s->cfg_screen_height;
     pthread_mutex_unlock(&s->cfg_lock);
 
+    const char *sock = sock_path;
+
+    int width, height;
     if (cw > 0 && ch > 0) {
-        s->screen_w = cw;
-        s->screen_h = ch;
+        width = cw;
+        height = ch;
     } else if (sw > 0 && sh > 0) {
-        s->screen_w = sw;
-        s->screen_h = sh;
+        width = sw;
+        height = sh;
     } else {
-       s->screen_w = ANativeWindow_getWidth(win);
-       s->screen_h = ANativeWindow_getHeight(win);
+        width = ANativeWindow_getWidth(s->window);
+        height = ANativeWindow_getHeight(s->window);
     }
 
-    /* dequeueBuffer needs the window connected to an API first (ANativeWindow_lock
-     * did this internally). Disconnect first so reconnect is idempotent. */
-    anw_api_disconnect(win, ANW_API_CPU);
-    if (anw_api_connect(win, ANW_API_CPU) != 0) {
-        LOGE("api_connect(CPU) failed");
-        return -1;
-    }
-
-    ANativeWindow_setBuffersGeometry(win, s->screen_w, s->screen_h,
-                                     AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
-
-    int min_undequeued = 0;
-    api.query(win, ANATIVEWINDOW_QUERY_MIN_UNDEQUEUED_BUFFERS, &min_undequeued);
-    int total = min_undequeued + 2;
-    if (total > MAX_COLLECT_BUFS)
-        total = MAX_COLLECT_BUFS;
-
-    api.setBufferCount(win, total);
-
-    s->buf_count = total;
-    if (collect_dmabufs(s) < 0)
-        return -1;
-
-    LOGI("connecting to %s (%dx%d, %d bufs, root=%d)", sock,
-         s->screen_w, s->screen_h, s->buf_count, use_root);
-
-    pthread_mutex_lock(&s->input_lock);
+    LOGI("connecting to %s (%dx%d, one staging slot, root=%d)", sock, width, height, use_root);
+    display_ctx *ctx = NULL;
     if (use_root) {
-        int ctrl_fd = recv_fd_via_root_helper(sock, helper_path, bridge_path);
-        if (ctrl_fd < 0) {
-            LOGE("root helper connect failed");
-            pthread_mutex_unlock(&s->input_lock);
+        int ctrl_fd = recv_fd_via_root_helper(s, sock, helper_path, bridge_path);
+        if (ctrl_fd < 0)
+            return -1;
+        int rc = gpu_staging ? connect_to_deamon_with_fd_gpu(&ctx, ctrl_fd) :
+                               connect_to_deamon_with_fd(&ctx, ctrl_fd);
+        if (rc < 0) {
+            LOGE("daemon HELLO via root helper failed for %s: %s", sock, strerror(errno));
             return -1;
         }
-        if (connect_to_deamon_with_fd(&s->ctx, ctrl_fd) < 0) {
-            LOGE("connect_to_deamon_with_fd failed");
-            pthread_mutex_unlock(&s->input_lock);
+    } else {
+        int rc = gpu_staging ? connect_to_deamon_gpu(&ctx, sock) : connect_to_deamon(&ctx, sock);
+        if (rc < 0) {
+            LOGE("daemon connect/HELLO failed for %s: %s", sock, strerror(errno));
             return -1;
         }
-    } else if (connect_to_deamon(&s->ctx, sock) < 0) {
-        LOGE("connect_to_deamon failed");
-        pthread_mutex_unlock(&s->input_lock);
-        return -1;
     }
-
-    set_screen_info(s->ctx, s->screen_w, s->screen_h,
-                    PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
-    push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
+    if (!s->running)
+        goto fail;
+    LOGI("daemon HELLO sent for %s; initializing %s window and staging slot",
+         sock, gpu_staging ? "Vulkan" : "EGL");
+    *output = gpu_staging ? window_output_create_gpu(s->window, width, height) :
+                            window_output_create(s->window, width, height);
+    if (!*output) {
+        LOGE("cannot create %s output and staging slot", gpu_staging ? "Vulkan" : "EGL");
+        abort_display_session(ctx);
+        disconnect(ctx);
+        return gpu_staging ? -2 : -1;
+    }
+    struct buf_info info;
+    const int fd = window_output_get_buffer(*output, &info);
+    if (fd < 0 || set_screen_info(ctx, width, height, info.format, s->refresh_mhz) < 0 ||
+        push_dmabufs(ctx, &fd, &info, 1) < 0) {
+        LOGE("cannot advertise display and staging slot");
+        goto fail;
+    }
+    LOGI("staging slot advertised for %s (%ux%u stride=%u); waiting for FDS_READY",
+         sock, info.width, info.height, info.stride);
 
     /* Register the camera service only when it was initialised (i.e. the user
      * enabled it in settings and granted CAMERA). The service_info lives in this
@@ -958,32 +959,25 @@ static int do_connect(struct consumer_state *s)
         s->camera_svc.allocate_resource = camera_allocate_resource;
         s->camera_svc.free_resource = camera_free_resource;
         s->camera_svc.userdata = s;
-        allocate_services(s->ctx, &s->camera_svc, 1);
+        allocate_services(ctx, &s->camera_svc, 1);
     }
 
-    set_fallback_callback(s->ctx, on_fallback, s);
-    set_exit_fallback_callback(s->ctx, on_exit_fallback, s);
-
-    audio_set_ctx(s->audio, s->ctx);   /* audio fd is now live; threads pick it up via get_audio_fd */
-
-    s->need_reconnect = false;
-    s->pacing.interval_start_ns = monotonic_now_ns();
-    LOGI("connected");
+    pthread_mutex_lock(&s->input_lock);
+    s->ctx = ctx;
     pthread_mutex_unlock(&s->input_lock);
     return 0;
+
+fail:
+    abort_display_session(ctx);
+    disconnect(ctx);
+    window_output_destroy(*output);
+    *output = NULL;
+    return -1;
 }
 
-static void on_fallback(void *userdata)
+static void notify_session_lost(struct consumer_state *s)
 {
-    struct consumer_state *s = userdata;
-    LOGI("fallback triggered");
-
-    /* The producer is gone (or the link broke): its top-app boost must end
-     * now, before any process can leak foreground priority for a whole
-     * session. One tree sweep covers every pid either mode boosted. */
-    topapp_restore_tree(s);
-
-    audio_set_ctx(s->audio, NULL);   /* the lib has closed the audio fd; stop touching it */
+    LOGI("display session lost");
 
     /* Let the owning MainActivity probe the daemon socket and close the window if the
      * daemon is gone. onFallback() marshals itself to the UI thread on the Java side. */
@@ -1004,7 +998,7 @@ static void on_fallback(void *userdata)
             (*g_jvm)->DetachCurrentThread(g_jvm);
     }
 
-    // Disable clip listener on Java side before stopping event thread
+    /* Disable the clipboard listener for the lost session. */
     if (g_jvm && s->clipboard_obj) {
         JNIEnv *env = NULL;
         bool attached = false;
@@ -1021,145 +1015,235 @@ static void on_fallback(void *userdata)
         if (attached)
             (*g_jvm)->DetachCurrentThread(g_jvm);
     }
-
-    stop_event_thread(s);
 }
 
-static void on_exit_fallback(void *userdata)
-{
-    struct consumer_state *s = userdata;
-    LOGI("exit fallback triggered");
 
-    /* Producer (re)connected. Mode 2 promotes the whole tree right here;
-     * mode 1 only discovers the namespace anchor now -- the per-pid boosts
-     * happen when the event thread drains KWin's producer-identity and
-     * active-window reports queued on the data socket. Runs before anything
-     * JNI below so a failure here never breaks the session restart.
-     * cfg_topapp_enable is read locklessly like every other cfg read on this
-     * path (Java only reconfigures between connections). */
-    if (s->topapp_run_enable && s->topapp_run_path[0] != '\0') {
-        pid_t root = topapp_discover_root(s, get_data_fd(s->ctx),
-                                          s->topapp_run_mode == 2);
-        if (root > 0) {
-            pthread_mutex_lock(&s->topapp_lock);
-            s->topapp_root_pid = root;
-            pthread_mutex_unlock(&s->topapp_lock);
+static void destroy_session(struct consumer_state *s, struct window_output *output)
+{
+    /* The render thread is the only lifetime owner. Wake the event thread even
+     * if it is reading a partial message, and stop audio before freeing ctx. */
+    display_ctx *ctx = s->ctx;
+    s->event_running = false;
+    abort_display_session(ctx);
+    join_event_thread(s);
+    audio_stop(s->audio);
+    topapp_restore_tree(s);
+    pthread_mutex_lock(&s->input_lock);
+    s->ctx = NULL;
+    pthread_mutex_unlock(&s->input_lock);
+    disconnect(ctx);
+    /* A producer may retain a reference and finish writing this allocation.
+     * Drop ours without reading or exporting it again; reconnect allocates anew. */
+    window_output_destroy(output);
+}
+
+/* True requests the EGL fallback on a new connection with a fresh slot. */
+static bool render_session(struct consumer_state *s, struct window_output *output, bool gpu_staging)
+{
+    struct presentation_queue queue = {0};
+    uint64_t serial = 0;
+
+    if (gpu_staging) {
+        uint64_t deadline = 0;
+        while (s->running) {
+            int rc = wait_for_gpu_staging(s->ctx, FRAME_POLL_MS);
+            if (rc == 0)
+                break;
+            if (rc < 0 && errno != EAGAIN)
+                return true;
+            /* Wait indefinitely for a producer to arrive. An older producer
+             * can pick up FDs but never acknowledge the GPU staging offer. */
+            if (rc == 1) {
+                const uint64_t now = monotonic_now_ns();
+                if (!now || (deadline && now >= deadline))
+                    return true;
+                if (!deadline)
+                    deadline = now + GPU_ACK_TIMEOUT_NS;
+            }
+        }
+        if (!s->running)
+            return false;
+        if (select_dmabuf_fenced(s->ctx, 0, -1) < 0) {
+            LOGE("initial GPU staging handoff failed: %s", strerror(errno));
+            return true;
+        }
+    } else {
+        while (s->running && select_dmabuf(s->ctx, 0) < 0) {
+            if (errno != EAGAIN) {
+                LOGE("initial staging slot handoff failed: %s", strerror(errno));
+                return false;
+            }
+            usleep(FRAME_POLL_MS * 1000);
         }
     }
-
+    if (!s->running)
+        return false;
+    /* SCREEN seeds the connection. Resend the latest rate now that the data
+     * channel is active, in case Android switched during the handshake. */
     send_refresh_rate(s);
+    LOGI("display session active (%s); waiting for first producer completion",
+         gpu_staging ? "Vulkan DMA-BUF + bidirectional SYNC_FD" : "EGL CPU upload");
+    s->pacing.interval_start_ns = monotonic_now_ns();
 
-    JNIEnv *env = NULL;
-    if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) {
-        LOGE("on_exit_fallback: AttachCurrentThread failed");
-        return;
+    while (s->running) {
+        poll_presentations(s, output, &queue);
+        TracyCZoneN(zRefresh, "refresh_done (producer render)", 1);
+        const uint64_t start = monotonic_now_ns();
+        int fence = DISPLAY_FRAME_PENDING;
+        while (s->running) {
+            fence = refresh_done(s->ctx, FRAME_POLL_MS);
+            if (fence != DISPLAY_FRAME_PENDING)
+                break;
+            const uint64_t now = monotonic_now_ns();
+            if (!start || !now || now - start >= COMPLETION_TIMEOUT_NS)
+                break;
+            poll_presentations(s, output, &queue);
+        }
+        const uint64_t completion = monotonic_now_ns();
+        TracyCZoneEnd(zRefresh);
+        if (fence < -1) {
+            if (s->running)
+                LOGE("no safe render completion; retiring staging slot (%d)", fence);
+            return gpu_staging && serial == 0;
+        }
+        if (start && completion >= start) {
+            s->pacing.producer_waits++;
+            pacing_add(&s->pacing.producer_wait, completion - start);
+        }
+
+        /* Serial counts producer completions, independently of presentation. */
+        if (!s->running) {
+            if (fence >= 0)
+                close(fence);
+            return false;
+        }
+        ++serial;
+        uint64_t prepared;
+        if (gpu_staging) {
+            const uint64_t draw_start = monotonic_now_ns();
+            int release = -1;
+            const bool has_render_fence = fence >= 0;
+            TracyCZoneN(zGpu, "Vulkan submit staging draw", 1);
+            const int drawn = window_output_draw_gpu(output, fence, &release);
+            TracyCZoneEnd(zGpu);
+            prepared = monotonic_now_ns();
+            if (drawn != 0) {
+                LOGE("Vulkan staging draw failed; retiring slot");
+                return true;
+            }
+            /* The next Linux write depends on this fence, not on the CPU or
+             * BufferQueue. The WSI image has its own present semaphore. */
+            const int selected = s->running ? select_dmabuf_fenced(s->ctx, 0, release) : -1;
+            if (release >= 0)
+                close(release);
+            if (selected != 0) {
+                if (s->running)
+                    LOGE("cannot return the GPU staging slot: %s", strerror(errno));
+                return false;
+            }
+            s->pacing.imported_fences += has_render_fence;
+            s->pacing.release_fences += release >= 0;
+            if (draw_start && prepared >= draw_start)
+                pacing_add(&s->pacing.gpu_draw, prepared - draw_start);
+        } else {
+            if (fence >= 0 && !wait_render_fence(s, output, &queue, fence)) {
+                if (s->running)
+                    LOGE("render fence did not complete; retiring staging slot");
+                return false;
+            }
+            if (!s->running)
+                return false;
+
+            const uint64_t upload_start = monotonic_now_ns();
+            TracyCZoneN(zUpload, "window_output_upload", 1);
+            const int uploaded = window_output_upload(output);
+            TracyCZoneEnd(zUpload);
+            prepared = monotonic_now_ns();
+            if (uploaded != 0) {
+                LOGE("staging texture upload failed; retiring staging slot");
+                return false;
+            }
+            if (!s->running)
+                return false;
+            if (upload_start && prepared >= upload_start)
+                pacing_add(&s->pacing.upload, prepared - upload_start);
+
+            /* Draw/swap only reads the private GLES texture after upload. */
+            if (release_dmabuf(s->ctx) != 0 || select_dmabuf(s->ctx, 0) != 0) {
+                LOGE("cannot hand off the uploaded staging slot");
+                return false;
+            }
+        }
+
+        struct window_frame frame;
+        TracyCZoneN(zSwap, "window_output_present", 1);
+        int drawn = window_output_present(output, &frame);
+        TracyCZoneEnd(zSwap);
+        const uint64_t swapped = monotonic_now_ns();
+        if (drawn != 0) {
+            s->pacing.swap_failures++;
+            pacing_report_if_due(s, swapped);
+            LOGE("%s present failed; retiring display session", gpu_staging ? "Vulkan" : "EGL");
+            /* A surface resize/out-of-date error gets a new swapchain while
+             * the window is still usable. Failures before first present can
+             * also indicate unsupported Vulkan WSI on this device. */
+            return gpu_staging && serial == 1;
+        }
+        s->pacing.swaps++;
+        if (serial == 1)
+            LOGI("first %s present succeeded (presentation tracking=%d)",
+                 gpu_staging ? "Vulkan" : "EGL", frame.tracked);
+        if (prepared && swapped >= prepared)
+            pacing_add(&s->pacing.draw_swap, swapped - prepared);
+        pacing_report_if_due(s, swapped);
+        track_presentation(s, &queue, frame, serial, swapped);
+        if (serial == 1 && s->running)
+            start_event_thread(s);
+        TracyCFrameMark;
     }
-
-    // Enable clip listener on Java side
-    jclass cls = (*env)->GetObjectClass(env, s->clipboard_obj);
-    jmethodID listenMid = (*env)->GetMethodID(env, cls, "nativeClipListening", "(Z)V");
-    if (listenMid)
-        (*env)->CallVoidMethod(env, s->clipboard_obj, listenMid, JNI_TRUE);
-
-    start_event_thread(s);
-
-    // Initial clipboard sync: read current system clipboard and send to producer
-    jmethodID syncMethod = (*env)->GetMethodID(env, cls, "nativeClipboardSync", "()V");
-    if (syncMethod)
-        (*env)->CallVoidMethod(env, s->clipboard_obj, syncMethod);
-
-    (*g_jvm)->DetachCurrentThread(g_jvm);
+    return false;
 }
 
 static void *render_thread_func(void *arg)
 {
     struct consumer_state *s = arg;
     LOGI("render thread started");
+    bool gpu_staging = true;
 
     while (s->running) {
-        if (s->need_reconnect) {
-            LOGI("reconnecting...");
-            TracyCZoneN(zConnect, "do_connect", 1);
-            int rc = do_connect(s);
-            TracyCZoneEnd(zConnect);
-            if (rc < 0) {
-                usleep(500000);
-                continue;
-            }
+        struct window_output *output = NULL;
+        TracyCZoneN(zConnect, "do_connect", 1);
+        int rc = do_connect(s, &output, gpu_staging);
+        TracyCZoneEnd(zConnect);
+        bool use_legacy = rc == -2;
+        if (rc == 0) {
+            use_legacy = render_session(s, output, gpu_staging);
+            destroy_session(s, output);
+            if (s->running && !use_legacy)
+                notify_session_lost(s);
         }
-
-        ANativeWindowBuffer *anb = NULL;
-        int acqfence = -1;
-        TracyCZoneN(zDequeue, "dequeueBuffer", 1);
-        int dq = api.dequeueBuffer(s->window, &anb, &acqfence);
-        TracyCZoneEnd(zDequeue);
-        const uint64_t dequeued_ns = monotonic_now_ns();
-        if (dq != 0 || !anb) {
-            usleep(16000);
+        if (s->running && gpu_staging && use_legacy) {
+            LOGI("GPU staging unavailable for this window; reconnecting with EGL and a fresh slot");
+            gpu_staging = false;
             continue;
         }
-        /* Emulate ANativeWindow_lock: CPU-wait the acquire fence so the buffer is
-         * already safe to write (SurfaceFlinger done reading the previous frame)
-         * before we hand it to the producer. A sync_file fd signals POLLIN. */
-        if (acqfence >= 0) {
-            TracyCZoneN(zAcqFence, "acquire fence wait", 1);
-            struct pollfd fpfd = { .fd = acqfence, .events = POLLIN };
-            const uint64_t wait_start_ns = monotonic_now_ns();
-            poll(&fpfd, 1, 1000);
-            const uint64_t wait_end_ns = monotonic_now_ns();
-            if (wait_end_ns >= wait_start_ns)
-                pacing_add(&s->pacing.acquire_fence_wait, wait_end_ns - wait_start_ns);
-            close(acqfence);
-            TracyCZoneEnd(zAcqFence);
-        }
-
-        int idx = -1;
-        for (int i = 0; i < s->buf_count; i++) {
-            if (s->buf_anb[i] == anb) {
-                idx = i;
-                break;
-            }
-        }
-
-        if (idx < 0) {
-            queue_surface_buffer(s, anb, -1, -1, 0);
-            usleep(16000);
-            continue;
-        }
-
-        if (s->buffer_queued_at_ns[idx] && dequeued_ns >= s->buffer_queued_at_ns[idx])
-            pacing_add(&s->pacing.buffer_reuse,
-                       dequeued_ns - s->buffer_queued_at_ns[idx]);
-        s->buffer_queued_at_ns[idx] = 0;
-
-        TracyCZoneN(zSelect, "select_dmabuf", 1);
-        int sel = select_dmabuf(s->ctx, idx);
-        TracyCZoneEnd(zSelect);
-        if (sel < 0) {
-            queue_surface_buffer(s, anb, -1, idx, 0);
-            usleep(16000);
-            continue;
-        }
-
-        /* The producer renders into the buffer and hands back a render-done fence
-         * over data_fd (reverse). Queue with it so SurfaceFlinger waits GPU-side
-         * before scanout -- this lets the producer submit before its GPU render
-         * completes (no glFinish stall). rfence == -1 falls back to "ready now". */
-        TracyCZoneN(zRefresh, "refresh_done (producer render)", 1);
-        const uint64_t wait_start_ns = monotonic_now_ns();
-        int rfence = refresh_done(s->ctx);
-        const uint64_t completion_ns = monotonic_now_ns();
-        TracyCZoneEnd(zRefresh);
-        if (completion_ns >= wait_start_ns) {
-            s->pacing.producer_waits++;
-            pacing_add(&s->pacing.producer_wait, completion_ns - wait_start_ns);
-        }
-        queue_surface_buffer(s, anb, rfence, idx, completion_ns);
-        TracyCFrameMark;
+        for (int i = 0; s->running && i < 25; ++i)
+            usleep(20000);
     }
 
+    ANativeWindow_release(s->window);
+    s->window = NULL;
     LOGI("render thread stopped");
     return NULL;
+}
+
+/* s->lock serializes nativeStart/Stop/Destroy. The render thread never takes it. */
+static void stop_render_thread(struct consumer_state *s)
+{
+    if (s->running) {
+        s->running = false;
+        pthread_join(s->render_thread, NULL);
+    }
 }
 
 /* ---------- JNI ---------- */
@@ -1195,6 +1279,9 @@ Java_com_anland_consumer_Native_nativeCreate(JNIEnv *env, jclass clazz)
     pthread_mutex_init(&s->input_lock, NULL);
     pthread_mutex_init(&s->cfg_lock, NULL);
     pthread_mutex_init(&s->topapp_lock, NULL);
+    atomic_init(&s->running, false);
+    atomic_init(&s->event_running, false);
+    atomic_init(&s->refresh_mhz, 0);
     s->cfg_topapp_mode = 1;
     strncpy(s->cfg_socket_path, "/data/local/tmp/display_daemon.sock",
             sizeof(s->cfg_socket_path) - 1);
@@ -1213,28 +1300,7 @@ Java_com_anland_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong h
     /* Stop the transport (mirrors nativeStop), release the camera client + audio
      * bridge, then free. */
     pthread_mutex_lock(&s->lock);
-    if (s->running) {
-        s->running = false;
-        pthread_mutex_unlock(&s->lock);
-        pthread_join(s->render_thread, NULL);
-        pthread_mutex_lock(&s->lock);
-    }
-    if (s->ctx) {
-        stop_event_thread(s);
-        join_event_thread(s);
-        topapp_restore_tree(s);
-        pthread_mutex_lock(&s->input_lock);
-        disconnect(s->ctx);
-        s->ctx = NULL;
-        pthread_mutex_unlock(&s->input_lock);
-    } else {
-        topapp_restore_tree(s);
-    }
-    cleanup_dmabufs(s);
-    if (s->window) {
-        ANativeWindow_release(s->window);
-        s->window = NULL;
-    }
+    stop_render_thread(s);
     pthread_mutex_unlock(&s->lock);
 
     audio_destroy(s->audio);
@@ -1346,36 +1412,10 @@ Java_com_anland_consumer_Native_nativeStart(
     if (!s)
         return;
 
-    if (!api_loaded) {
-        if (anw_api_load(&api) < 0) {
-            LOGE("failed to load ANativeWindow hidden API");
-            return;
-        }
-        api_loaded = true;
-    }
-
     pthread_mutex_lock(&s->lock);
 
-    if (s->running) {
-        s->running = false;
-        pthread_mutex_unlock(&s->lock);
-        pthread_join(s->render_thread, NULL);
-        pthread_mutex_lock(&s->lock);
-    }
-
-    if (s->ctx) {
-        pthread_mutex_lock(&s->input_lock);
-        disconnect(s->ctx);
-        s->ctx = NULL;
-        pthread_mutex_unlock(&s->input_lock);
-    }
+    stop_render_thread(s);
     s->motion_has_last = false;
-    cleanup_dmabufs(s);
-
-    if (s->window) {
-        ANativeWindow_release(s->window);
-        s->window = NULL;
-    }
 
     s->window = ANativeWindow_fromSurface(env, surface);
     if (!s->window) {
@@ -1396,19 +1436,19 @@ Java_com_anland_consumer_Native_nativeStart(
      * event thread calls back into (the Clipboard instance). */
     s->clipboard_obj = (*env)->NewGlobalRef(env, clipboardTarget);
 
-    /* Owning MainActivity for the fallback callback (see on_fallback). */
+    /* Owning MainActivity for display-session loss notification. */
     if (s->activity_obj) {
         (*env)->DeleteGlobalRef(env, s->activity_obj);
     }
     s->activity_obj = activityTarget ? (*env)->NewGlobalRef(env, activityTarget) : NULL;
 
     s->running = true;
-    s->need_reconnect = true;
-    pthread_create(&s->render_thread, NULL, render_thread_func, s);
-
-    /* Audio streams live independently of the connection; the render thread attaches
-     * the fd via audio_set_ctx() once connected. */
-    audio_start(s->audio);
+    if (pthread_create(&s->render_thread, NULL, render_thread_func, s) != 0) {
+        LOGE("could not start render thread");
+        s->running = false;
+        ANativeWindow_release(s->window);
+        s->window = NULL;
+    }
 
     pthread_mutex_unlock(&s->lock);
 }
@@ -1423,28 +1463,7 @@ Java_com_anland_consumer_Native_nativeStop(
 
     pthread_mutex_lock(&s->lock);
 
-    if (s->running) {
-        s->running = false;
-        pthread_mutex_unlock(&s->lock);
-        pthread_join(s->render_thread, NULL);
-        pthread_mutex_lock(&s->lock);
-    }
-
-    /* Stop audio before the ctx (and its fd) is torn down. */
-    audio_set_ctx(s->audio, NULL);
-    audio_stop(s->audio);
-
-    if (s->ctx) {
-        stop_event_thread(s);
-        join_event_thread(s);
-        topapp_restore_tree(s); /* stopping the pipeline ends the boost */
-        pthread_mutex_lock(&s->input_lock);
-        disconnect(s->ctx);
-        s->ctx = NULL;
-        pthread_mutex_unlock(&s->input_lock);
-    } else {
-        topapp_restore_tree(s);
-    }
+    stop_render_thread(s);
 
     // Disable clip listener on Java side
     if (g_jvm && s->clipboard_obj) {
@@ -1464,13 +1483,6 @@ Java_com_anland_consumer_Native_nativeStop(
             (*g_jvm)->DetachCurrentThread(g_jvm);
     }
 
-    cleanup_dmabufs(s);
-
-    if (s->window) {
-        ANativeWindow_release(s->window);
-        s->window = NULL;
-    }
-
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -1479,11 +1491,11 @@ Java_com_anland_consumer_Native_nativeSetRefreshRate(
     JNIEnv *env, jclass clazz, jlong handle, jfloat hz)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || hz <= 0.0f)
+    if (!s || !(hz >= 1.0f && hz <= 1000.0f))
         return;
-    s->refresh_mhz = (uint32_t)(hz * 1000.0f + 0.5f);
-    // Apply live if already connected; otherwise do_connect() seeds it.
-    send_refresh_rate(s);
+    const uint32_t mhz = (uint32_t)(hz * 1000.0f + 0.5f);
+    if (atomic_exchange(&s->refresh_mhz, mhz) != mhz)
+        send_refresh_rate(s);
 }
 
 JNIEXPORT void JNICALL

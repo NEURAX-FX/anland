@@ -111,15 +111,15 @@ void anland_scene_legacy_drop_session(anland_scene_legacy *b);
 /* Hand the accepted commit to the consumer: selects the buffer the consumer
  * asked for, commits it and flips. Returns 0 when the frame was handed over.
  *
- * This does NOT mean the frame reached the display — that is reported as
- * PRESENTED through the scene once the consumer acknowledges it. Returns -1 when
- * there is no accepted commit or the transport is in fallback. */
+ * This does NOT mean the frame reached the display. FRAME_CONSUMED through
+ * the scene only reports transport progress. Returns -1 when there is no
+ * accepted commit or the transport is in fallback. */
 int anland_scene_legacy_present(anland_scene_legacy *b);
 
-/* Service the transport for the CURRENT session: turn the consumer's
- * buffer-ready signal into PRESENTED for the frame in flight, then publish the
- * next RENDER_TARGET_READY. timeout_ms < 0 blocks until something happens; 0
- * polls.
+/* Service the transport for the CURRENT session: turn a valid next target
+ * selection into FRAME_CONSUMED (opt-in; see anland_scene.h) for the frame in
+ * flight, then publish RENDER_TARGET_READY. Neither proves presentation.
+ * timeout_ms < 0 blocks until something happens; 0 polls.
  *
  * It does NOT reconnect. When the session is gone the in-flight work is dropped
  * and the call returns 0; the DE re-establishes the session with

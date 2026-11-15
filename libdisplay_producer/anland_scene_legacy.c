@@ -14,15 +14,14 @@
  *                holds its lock, so re-entering would deadlock.
  *   present()  → drains any stale buffer-ready signal, then commits + flips the
  *                buffer the consumer selected. The commit becomes IN FLIGHT.
- *   pump()     → when the consumer raises buffer-ready again (it consumed the
- *                frame and wants the next buffer), the in-flight commit is
- *                reported PRESENTED. That is the only point where the frame is
- *                known to have reached the consumer.
+ *   pump()     → a valid next target retires the in-flight commit for pacing
+ *                (FRAME_CONSUMED when enabled; not display presentation). Only the newly
+ *                selected slot is released for rendering.
  *
  * The stale-signal drain in present() is what keeps the accounting honest: the
  * consumer's handshake raises buffer-ready before the producer has ever flipped,
- * so without draining, the first pump() would report a frame as presented that
- * the consumer had not yet consumed.
+ * so without draining, the first pump() could retire a frame that the consumer
+ * had not yet consumed.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE /* for dup()/eventfd(); KWin's build already defines it */
@@ -63,8 +62,7 @@ struct anland_scene_legacy {
      * A new target proves only that selected slot is writable, not the old one. */
     uint64_t retained[ANLAND_DEVICE_MAX_BUFS][ANLAND_SCENE_MAX_LAYERS];
     size_t retained_count[ANLAND_DEVICE_MAX_BUFS];
-    /* Buffers the in-flight frame used; released once the consumer rotated away
-     * from them (see pump()). */
+    /* Buffers the in-flight frame used, for teardown deduplication. */
     uint64_t inflight_buffers[ANLAND_SCENE_MAX_LAYERS];
     size_t inflight_buffer_count;
 
@@ -217,13 +215,12 @@ static int publish_target_ready(struct anland_scene_legacy *b)
                                                     (uint32_t) count);
 }
 
-/* Discard any buffer-ready signal the consumer raised before we flipped.
- *
- * The transport's eventfd is NOT non-blocking, so poll first — a bare
- * eventfd_read() would block forever when nothing is pending. One read is enough:
- * an eventfd read returns the accumulated counter and resets it to zero. */
+/* Only the legacy eventfd can contain a pre-flip notification to drain.
+ * Every packet on the negotiated fence socket belongs to a single handoff. */
 static void drain_buffer_ready(struct anland_scene_legacy *b)
 {
+    if (anland_device_uses_gpu_staging(b->dev))
+        return;
     const int fd = anland_device_buffer_ready_fd(b->dev);
     if (fd < 0)
         return;
@@ -494,17 +491,13 @@ int anland_scene_legacy_present(anland_scene_legacy *b)
      * acknowledgement of this frame. */
     drain_buffer_ready(b);
 
-    /* Flip with THIS commit's fence. pageflip() stashes the fence and triggers the
-     * refresh; it takes ownership unconditionally (even on the error path), so the
-     * adapter must not close it afterwards. Passing -1 when the commit carried no
-     * fence correctly clears any predecessor.
-     *
-     * Do not replace this with a bare trigger_refresh(): that would send whatever
-     * fence a previous frame left stashed and silently drop this one. */
+    /* Transfer ownership of THIS commit's fence, including -1 (no fence).
+     * notify_frame_done distinguishes an actual successful send from fallback. */
     const int fence = b->pending_fence;
     b->pending_fence = -1;
 
-    if (anland_device_pageflip(b->dev, fence, NULL, NULL) != 0) {
+    anland_device_set_render_fence(b->dev, fence);
+    if (!anland_device_notify_frame_done(b->dev)) {
         const uint64_t failed = b->pending_commit;
         drop_pending(b);
         anland_scene_backend_dropped(b->scene, failed, ANLAND_SCENE_DROP_BACKEND_ERROR);
@@ -554,31 +547,18 @@ int anland_scene_legacy_pump(anland_scene_legacy *b, int timeout_ms)
      * zero and no wall-clock arrival deadline; only proven loss retires it. */
     if (!b->ready_pending) {
         if (!ready) return 0;
-        const int fd = anland_device_buffer_ready_fd(b->dev);
-        if (fd < 0)
-            return 0;
-        eventfd_t v;
-        if (eventfd_read(fd, &v) != 0)
+        const int consumed = anland_device_read_buffer_ready(b->dev);
+        if (consumed < 0) {
+            drop_session(b);
+            return -1;
+        }
+        if (!consumed)
             return 0;
 
         /* Remember the consumed ACK before any fallible release publication.
          * Subsequent pump() calls retry without waiting for another eventfd. */
         b->ready_pending = true;
         b->ready_slot = anland_device_current_fb_raw(b->dev);
-        if (b->inflight_commit != 0) {
-            const uint64_t done = b->inflight_commit;
-            b->inflight_commit = 0;
-            b->inflight_buffer_count = 0;
-            if (anland_scene_backend_presented(b->scene, done, 0) == 0) {
-                b->frames_acked++;
-                anland_pacing_note_ack(&b->pacing, b->submitted_at, b->flipped_at,
-                                       anland_pacing_now_ns());
-            } else {
-                anland_pacing_note_dropped(&b->pacing);
-            }
-            b->submitted_at = 0;
-            b->flipped_at = 0;
-        }
     }
     const int slot = b->ready_slot;
     if (slot < 0 || slot >= anland_device_fb_count(b->dev) ||
@@ -587,6 +567,24 @@ int anland_scene_legacy_pump(anland_scene_legacy *b, int timeout_ms)
         drop_session(b);
         anland_device_force_fallback(b->dev);
         return -1;
+    }
+    /* A bad/stale slot proves session failure, not consumption. Validate it
+     * before retiring the live commit; teardown can still drop it and retire
+     * its retained buffers exactly once. For a valid slot, retire the commit
+     * before release publication (the scene rejects releasing live buffers). */
+    if (b->inflight_commit != 0) {
+        const uint64_t done = b->inflight_commit;
+        b->inflight_commit = 0;
+        b->inflight_buffer_count = 0;
+        if (anland_scene_backend_consumed(b->scene, done) == 0) {
+            b->frames_acked++;
+            anland_pacing_note_ack(&b->pacing, b->submitted_at, b->flipped_at,
+                                   anland_pacing_now_ns());
+        } else {
+            anland_pacing_note_dropped(&b->pacing);
+        }
+        b->submitted_at = 0;
+        b->flipped_at = 0;
     }
     while (b->retained_count[slot] != 0) {
         size_t i = b->retained_count[slot] - 1;

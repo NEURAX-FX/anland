@@ -73,6 +73,69 @@ int recv_fds(int sock, void *data, size_t data_len,
     return (int)n;
 }
 
+int send_frame_fence(int sock, unsigned char marker, int fd)
+{
+    struct iovec iov = {.iov_base = &marker, .iov_len = 1};
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
+    if (fd >= 0) {
+        msg.msg_control = control.bytes;
+        msg.msg_controllen = sizeof(control.bytes);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &fd, sizeof(fd));
+    }
+    ssize_t n;
+    do {
+        n = sendmsg(sock, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+    } while (n < 0 && errno == EINTR);
+    return n == 1 ? 0 : -1;
+}
+
+int recv_frame_fence(int sock, unsigned char *marker, int *fd)
+{
+    struct iovec iov = {.iov_base = marker, .iov_len = 1};
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes)};
+    *fd = -1;
+    const ssize_t n = recvmsg(sock, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+    if (n < 0)
+        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? 0 : -1;
+
+    int valid = n == 1 && !(msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC));
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS ||
+            c->cmsg_len < CMSG_LEN(0)) {
+            valid = 0;
+            continue;
+        }
+        if (c->cmsg_len != CMSG_LEN(sizeof(int)))
+            valid = 0;
+        const size_t count = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (size_t i = 0; i < count; ++i) {
+            int received;
+            memcpy(&received, CMSG_DATA(c) + i * sizeof(int), sizeof(received));
+            if (*fd < 0)
+                *fd = received;
+            else {
+                close(received);
+                valid = 0;
+            }
+        }
+    }
+    if (valid)
+        return 1;
+    if (*fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+    errno = n == 0 ? EPIPE : EPROTO;
+    return -1;
+}
+
 int connect_unix(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

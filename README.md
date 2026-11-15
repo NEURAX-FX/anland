@@ -39,6 +39,12 @@
 > (displays) it. The consumer is the resource owner because it is the side that
 > physically scans the buffers out to the panel.
 
+The Android v5 consumer allocates a separate, single-plane LINEAR RGBA8888
+staging DMA-BUF. It never exports a gralloc handle or lets the producer write
+into Android's display buffers. A compatible Niri/Zink/PanVK producer and
+Android Vulkan consumer can share the staging slot without CPU access. Other
+sessions use the GLES upload and EGL window path.
+
 ---
 
 ## 2. V3 changes at a glance
@@ -360,10 +366,10 @@ void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event) {
 
 ## 7. Steady‑state frame loop
 
-Once both sides have left fallback, every frame is exchanged **without touching the
-daemon** — over the shared `shm` page, `buf_ready_efd` and the **dedicated fence
-channel** (`socketpair`). V3 adds clipboard exchanges on the data channel, but these
-are **asynchronous and do not affect the frame cadence**.
+Steady-state frame exchange never needs the daemon. The diagram shows the
+legacy `shm` + `buf_ready_efd` + fence socket path. GPU staging uses the same
+FD handoff but exchanges slot readiness and release on the fence socket.
+Input and clipboard use the separate data socket.
 
 ```mermaid
 sequenceDiagram
@@ -372,7 +378,7 @@ sequenceDiagram
     participant SHM as shm index
     participant P as Producer
 
-    Note over C,P: one‑time, right after handshake
+    Note over C,P: once per session, before first slot selection
     C->>P: BUFS_READY + dmabuf fds (data channel)
     P-->>P: import dmabufs
 
@@ -383,8 +389,11 @@ sequenceDiagram
         P-->>P: render into dmabuf[idx]
         P-->>C: sendmsg(fence_fd, 1 byte ± fence fd via SCM_RIGHTS) (trigger_refresh)
         C-->>C: recvmsg(fence_fd) → get fence fd (refresh_done)
-        C->>C: queueBuffer(fence_fd) → SurfaceFlinger waits GPU-side
+        C->>C: wait fence, sync CPU read, upload, release staging slot
+        C->>C: draw private texture and swap (can overlap next producer render)
     end
+
+    C-->>P: optional FRAME_PRESENTATION with actual EGL display time (data channel)
 
     Note over C,P: input flows the other way
     C->>P: INPUT_EVENT (data channel, poll_input_event)
@@ -398,14 +407,42 @@ sequenceDiagram
     P-->>P: update RenderLoop pacing
 ```
 
-- `select_dmabuf(idx)` → writes `idx` to shm, signals `buf_ready_efd`.
+- `select_dmabuf(idx)` writes the index and signals `buf_ready_efd` only when an active producer can accept it; it returns zero on handoff.
 - producer wakes on `buf_ready_efd`, reads idx from shm, renders, may call
   `set_render_fence(fence_fd)` to stash a render-done fence, then calls
   `trigger_refresh()`.
 - `trigger_refresh()` sends 1 byte (+ optionally fence fd via `SCM_RIGHTS`)
   on the fence socketpair.
-- `refresh_done()` waits on fence channel with a **5 s** timeout, reads the message,
-  returns the fence fd (or `-1` if none).
+- `refresh_done(ctx, timeout_ms)` waits for a completion without releasing the
+  slot. It returns an owned fence fd, `-1` for synchronous completion,
+  `DISPLAY_FRAME_PENDING` on a poll timeout, or `DISPLAY_FRAME_FAILED` on loss.
+  The Android render loop abandons the session if no completion arrives within
+  5 s or the fence fails. Call `release_dmabuf()` only when reading is finished.
+- `INPUT_TYPE_FRAME_PRESENTATION` is an optional fixed-size input event. Its
+  serial counts render completions from 1 in each session. Actual display time
+  comes from `VK_GOOGLE_display_timing` or `EGL_DISPLAY_PRESENT_TIME_ANDROID`.
+  Zero or missing reports neither block rendering nor confirm presentation.
+
+Android v5 reports the current effective window display rate (mHz) at startup
+and on changes. Niri updates the output mode and frame clock without reconnecting.
+Following the rate does not request a display mode. The `pacing` log separates
+Android's rate, successful swaps, and frames with actual display timestamps.
+
+**GPU staging (Niri/Zink/PanVK).** Point `ANLAND_PANVK_ICD` at the absolute
+path of the kbase PanVK ICD already selected by Vulkan for Niri. The patched
+ICD requests `BASE_MEM_UNCACHED_GPU` only while importing the negotiated staging
+DMA-BUF. Do not set `PANVK_KBASE_IMPORT_SET` globally for this feature. Disable
+Niri's `wait-for-frame-completion-before-queueing` debug option to avoid CPU
+waits on Linux render fences.
+
+The consumer offers GPU staging with a `SOCK_SEQPACKET` fence socket in its
+existing v5 FD deposit. After `FDS_READY` and the producer's GPU ACK, Linux
+renders into the single slot. Android imports the render `SYNC_FD`, samples
+the slot in a fullscreen Vulkan draw, and returns a release `SYNC_FD` before
+presenting the separate swapchain image. Linux queues that dependency before
+its next draw. No staging mapping, CPU cache sync or texture upload is needed.
+No ACK or unavailable Vulkan support falls back to EGL with a fresh session
+and allocation.
 
 ### 7.1 Clipboard exchange (V3)
 
@@ -531,30 +568,28 @@ tick.
 
 ### 9.2 Consumer state machine
 
-The consumer creates its resources and deposits them at `connect_to_deamon()`, starting
-in fallback. It leaves fallback **lazily**: each `select_dmabuf()` first calls
-`try_exit_fallback()`.
+Each consumer context deposits its channels once and exports the staging slot
+over its private data socket. The first slot handoff waits for `FDS_READY` and,
+in GPU mode, for the producer's GPU ACK. An incomplete handshake is retryable;
+a dead or malformed session is not.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Fallback: connect_to_deamon()<br/>create resources + deposit fds
-
-    Fallback --> Fallback: no FDS_READY yet<br/>(select_dmabuf is a no‑op)
-    Fallback --> Connected: FDS_READY seen<br/>→ push_dmabufs()
-
-    Connected --> Connected: select / refresh frames
-    Connected --> Fallback: send fail<br/>refresh timeout 5s<br/>→ enter_fallback()
-
-    note right of Fallback
-        enter_fallback() rebuilds eventfd/socketpair/shm
-        and re‑sends CONSUMER_HELLO (re‑deposits)
-    end note
+    [*] --> Waiting: new context and staging slot
+    Waiting --> Active: FDS_READY and GPU ACK if negotiated
+    Active --> Active: select / complete / sample or upload / release
+    Waiting --> Dead: handshake failure
+    Active --> Dead: transport, fence or presentation failure
+    Dead --> [*]: close channels and retire slot
 ```
 
-> [!NOTE]
-> **V3 addition**: the consumer exposes a `set_exit_fallback_callback()` to let the
-> host app react when the producer reconnects (e.g. start the event thread, sync
-> clipboard). This is **optional** and does not change the state machine.
+Reconnecting starts a new context with a new allocation, even if an old
+producer still holds a reference to the retired DMA-BUF.
+
+Root connections use a private, single-attempt socket for the helper's FD
+handoff. Stopping a window cancels its wait without blocking on `su`. The
+consumer swaps the first frame before starting audio, clipboard synchronization,
+and optional foreground scheduling, so these services cannot delay display startup.
 
 ---
 
@@ -563,7 +598,7 @@ stateDiagram-v2
 | Event | Detected by | Reaction |
 |-------|-------------|----------|
 | Producer drops consumer | `POLLHUP`/`POLLERR` on `data_fd`, or send failure | `enter_fallback()`: release consumer resources, fire callback, resume 200 ms reconnect timer. |
-| Consumer loses producer | send failure or 5 s `refresh_done` timeout | `enter_fallback()`: tear down + rebuild eventfd/socketpair/shm, re‑send `CONSUMER_HELLO` (re‑deposit). |
+| Consumer loses producer | transport or completion failure | Stop the session and reconnect with fresh channels and a fresh staging allocation. |
 | Consumer reconnects mid‑session | daemon `CONSUMER_HELLO` with ≥3 fds | replaces deposited fds; if a producer is waiting, delivers immediately. |
 | Either peer reconnects | new `*_HELLO` | the daemon frees the previous client of that role and installs the new one. |
 
@@ -571,8 +606,8 @@ stateDiagram-v2
 
 ## 11. Design notes
 
-- **Single reconnect path** — both startup and recovery funnel through
-  `try_exit_fallback()`; there is no separate "first connect" logic.
+- **Fresh consumer session on failure** — never re-export a staging buffer
+  whose old producer might still be writing.
 - **Atomic exit** — the producer leaves fallback only with *both* the fds and the
   dmabufs in hand, so the backend can import and render immediately.
 - **Daemon is off the hot path** — it only brokers the handshake; every
@@ -581,9 +616,9 @@ stateDiagram-v2
   the producer's reconnect loop stays responsive when no consumer is present.
 - **Display‑mode lock** — the first `screen_info` wins; mismatching consumers are
   rejected.
-- **GPU‑side fence** — the producer sends a real dma-buf sync-file fence via
-  `SCM_RIGHTS`; the consumer hands it to SurfaceFlinger, eliminating CPU‑side
-  `glFinish()` stalls.
+- **Render fence** — the producer sends a native sync-file via `SCM_RIGHTS`.
+  The Android consumer waits before reading the staging DMA-BUF. EGL handles
+  synchronization with SurfaceFlinger for its own window buffers.
 - **Bidirectional clipboard (V3)** — clipboard data flows both ways over the
   data channel using a header + payload two‑packet protocol. An echo guard prevents
   loops. Variable‑length events require all receivers to drain trailing payloads.
@@ -604,8 +639,8 @@ debug {
 ```
 
 This blocks the compositor until the frame is ready, so it can reduce
-throughput. By default, Anland passes a native acquire fence to Android and
-waits on the CPU only if that fence cannot be exported.
+throughput. By default, Niri passes a native fence for the Android consumer to
+wait on before uploading pixels, and waits itself only if export is unavailable.
 
 ---
 
@@ -630,24 +665,13 @@ waits on the CPU only if that fence cannot be exported.
 
 > **Producer incompatibility**: V2 producer's `poll_input_event()` signature is unchanged, but its **behavior changed**. A V3 consumer may send `INPUT_TYPE_CLIPBOARD` variable-length events. A V2 producer that does not drain the trailing payload will corrupt the data channel stream.
 
-### 12.2 Consumer library (`libdisplay_consumer`) — **API and ABI incompatible**
+### 12.2 Consumer library (`libdisplay_consumer`)
 
-| Function | V2 | V3 | Compatibility |
-|----------|----|----|---------------|
-| `connect_to_deamon()` | Same signature | Same signature | ✅ Unchanged |
-| `refresh_done()` | Returns fence fd (>=0 or -1) | Same signature | ✅ Unchanged |
-| `push_dmabufs()` | Same signature | Same signature | ✅ Unchanged |
-| `select_dmabuf()` | Same signature | Same signature | ✅ Unchanged |
-| `set_screen_info()` | Same signature | Same signature | ✅ Unchanged |
-| `set_fallback_callback()` | Same signature | Same signature | ✅ Unchanged |
-| `disconnect()` | Same signature | Same signature | ✅ Unchanged |
-| `push_input_event()` | Same signature | Same signature | ⚠️ **Not for clipboard** (use `push_input_event_with_length()`) |
-| `poll_output_event()` | — | **V3 new**: poll producer→consumer output events | ✅ New API |
-| `push_input_event_with_length()` | — | **V3 new**: send variable-length input event (clipboard) | ✅ New API |
-| `poll_output_event_extend_data()` | — | **V3 new**: drain variable-length output payload | ✅ New API |
-| `set_exit_fallback_callback()` | — | **V3 new**: callback on producer reconnect | ✅ New API |
-| `get_data_fd()` | — | **V3 new**: get data channel fd | ✅ New API |
-| `handle_unhandled_event()` | — | **V3 new**: drain unhandled variable-length events | ❌ **Required**: must call to keep stream clean |
+The v5 consumer API is session-scoped. `push_dmabufs()` exports one pool per
+context, and `refresh_done(ctx, timeout_ms)` leaves the slot held until
+`release_dmabuf()`. `abort_display_session()` wakes I/O threads before the
+owner joins them and calls `disconnect()`. See `display_consumer.h` for the
+current API; the old fallback callbacks are not used in this flow.
 
 > **Consumer incompatibility**: A V3 producer may send `DATA_MSG_OUTPUT_EVENT`(103) with clipboard payload. A V2 consumer has no `poll_output_event()` and cannot read these messages, corrupting the data channel stream.
 

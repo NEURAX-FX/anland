@@ -31,6 +31,7 @@ anland_niri_bridge *anland_niri_open(const char *endpoint)
         free(b);
         return NULL;
     }
+    anland_scene_enable_frame_consumed(anland_de_backend_scene(b->backend));
     anland_layer_desc_t layer = {
         .kind = ANLAND_LAYER_NORMAL, .name = "niri composite",
         .opacity = 1.0f, .visible = true
@@ -113,6 +114,22 @@ int anland_niri_get_target(anland_niri_bridge *b, anland_niri_target *out)
     out->modifier = fb.modifier;
     out->fd = fb.fd;
     return 0;
+}
+void anland_niri_allow_gpu_staging(anland_niri_bridge *b)
+{
+    anland_device_allow_gpu_staging(device(b));
+}
+int anland_niri_uses_gpu_staging(anland_niri_bridge *b)
+{
+    return anland_device_uses_gpu_staging(device(b));
+}
+int anland_niri_take_slot_fence(anland_niri_bridge *b, uint64_t generation, uint32_t index)
+{
+    anland_de_target_t target;
+    if (!b || anland_de_backend_get_target(b->backend, &target) != 0 ||
+        target.generation != generation || target.index != index)
+        return -2;
+    return anland_device_take_slot_fence(device(b));
 }
 int anland_niri_submit(anland_niri_bridge *b, uint64_t generation,
                        uint32_t index, int fence, uint64_t *commit_id)
@@ -217,6 +234,10 @@ int anland_niri_poll_input(anland_niri_bridge *b, anland_niri_input *out)
             out->discrete = ev.pointer_axis.discrete; break;
         case ANLAND_DEVICE_IN_CLIPBOARD: out->payload_size = ev.clipboard.size; break;
         case ANLAND_DEVICE_IN_DISPLAY_REFRESH: out->refresh_mhz = ev.display.refresh_mhz; break;
+        case ANLAND_DEVICE_IN_FRAME_PRESENTATION:
+            out->presentation_serial = ev.frame_presentation.serial;
+            out->presentation_ns = ev.frame_presentation.presentation_ns;
+            break;
         case ANLAND_DEVICE_IN_TEXT_INPUT: out->payload_size = ev.text_input.size; break;
         case ANLAND_DEVICE_IN_RESOURCE:
         case ANLAND_DEVICE_IN_RESOURCE_INVALID:

@@ -117,12 +117,16 @@ bool is_fallback(display_ctx *ctx);
  * return code alone. Backends use this to tell the two apart and reconnect from
  * scratch instead of polling forever for a consumer that can never arrive. */
 bool is_daemon_alive(display_ctx *ctx);
-/* Poll the current target-ready eventfd AND consumer/control socket hangups.
- * 1: ready, 0: pending/fallback/interrupted, -1: loss detected and fallback run.
- * Non-consuming: caller still reads the ready eventfd; input/SCM_RIGHTS are
- * untouched. timeout_ms is per-call (-1 waits), never an arrival deadline.
+/* Poll current target-ready and peer liveness without consuming any bytes.
+ * 1: ready, 0: pending/fallback/interrupted, -1: loss and fallback.
  * Serialize with input/pump/session calls; fallback callbacks must not re-enter. */
 int poll_buffer_ready(display_ctx *ctx, int timeout_ms);
+/* Consume a polled notification: 1 consumed, 0 pending, -1 on loss. */
+int read_buffer_ready(display_ctx *ctx);
+void allow_gpu_staging(display_ctx *ctx, bool allow);
+bool uses_gpu_staging(const display_ctx *ctx);
+/* Returns an owned fd, -1 for a complete slot, -2 if not ready. */
+int take_slot_fence(display_ctx *ctx);
 
 /* Drop the current consumer connection without dropping the daemon control
  * connection.  This is used when the KWin/EGL side cannot import a freshly
@@ -141,6 +145,7 @@ int  get_data_fd(display_ctx *ctx);
 /* Current local end of the audio socketpair, or -1 in fallback. Changes across
  * reconnects; re-point the audio engine on each exit/enter fallback. */
 int  get_audio_fd(display_ctx *ctx);
+/* Legacy eventfd, or readable fence socket in GPU staging mode. */
 int  get_buffer_ready_fd(display_ctx *ctx);
 int  get_buf_count(display_ctx *ctx);
 /* Consumer-published framebuffer index, clamped into [0, buf_count) so callers

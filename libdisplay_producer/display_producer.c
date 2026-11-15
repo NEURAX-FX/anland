@@ -5,10 +5,13 @@
 #include "socket_utils.h"
 
 #include <errno.h>
+#include <linux/sync_file.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -41,10 +44,12 @@ struct display_ctx {
     int      ctrl_fd;
     int      data_fd;
     int      buf_ready_efd;
-    int      fence_fd;        /* write end of the dedicated render-done fence channel */
+    int      fence_fd;        /* frame completion and, in GPU mode, slot release */
     int      shm_fd;
     int      audio_fd;        /* local end of the bidirectional audio socketpair (hello slot 4) */
     int      pending_render_fence; /* render-done fence for the in-flight frame */
+    int      slot_fence;           /* owned dependency for the selected slot */
+    bool     allow_gpu_staging, gpu_staging, gpu_expect_slot, gpu_started;
     volatile uint32_t *shm_ptr;
     uint32_t screen_w, screen_h;
     uint32_t pixel_format;
@@ -118,6 +123,8 @@ static void release_consumer_resources(display_ctx *ctx)
     if (ctx->fence_fd >= 0)         { close(ctx->fence_fd);         ctx->fence_fd = -1; }
     if (ctx->audio_fd >= 0)         { close(ctx->audio_fd);         ctx->audio_fd = -1; }
     if (ctx->pending_render_fence >= 0) { close(ctx->pending_render_fence); ctx->pending_render_fence = -1; }
+    if (ctx->slot_fence >= 0)       { close(ctx->slot_fence);        ctx->slot_fence = -1; }
+    ctx->gpu_staging = ctx->gpu_expect_slot = ctx->gpu_started = false;
     if (ctx->shm_ptr)               { munmap((void *)ctx->shm_ptr, sizeof(uint32_t)); ctx->shm_ptr = NULL; }
     if (ctx->shm_fd >= 0)           { close(ctx->shm_fd);           ctx->shm_fd = -1; }
 }
@@ -271,6 +278,7 @@ static int connect_daemon(display_ctx **out, const char *socket_path, bool defer
     ctx->shm_fd = -1;
     ctx->audio_fd = -1;
     ctx->pending_render_fence = -1;
+    ctx->slot_fence = -1;
     ctx->shm_ptr = NULL;
     ctx->fallback = true; // stay in fallback until try_exit_fallback() succeeds
     for (int i = 0; i < MAX_BUFS; i++)
@@ -355,38 +363,11 @@ int trigger_refresh(display_ctx *ctx)
         return 0;
     }
 
-    /* Send exactly one render-done message per frame on the dedicated fence channel
-     * (producer->consumer). The message itself is the "frame rendered" signal -- no
-     * separate eventfd, no cross-channel ordering. The render fence rides as
-     * SCM_RIGHTS ancillary data when we have one; otherwise a bare byte is sent so
-     * the consumer's per-frame recv always has exactly one message (it then queues
-     * with -1). The consumer hands the fence to queueBuffer -> SurfaceFlinger waits
-     * GPU-side. NON-BLOCKING: this runs on kwin's main thread, which must never block
-     * on our socket. In lockstep the consumer always drains, so the one-message
-     * buffer never fills; a momentary miss self-heals via the consumer's 5s
-     * poll->fallback rather than freezing the compositor. data_fd's reverse direction
-     * is intentionally left unused (reserved for future extension). */
-    char b = 0;
-    struct iovec iov = { .iov_base = &b, .iov_len = 1 };
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } cmsg;
-    struct msghdr msg = {
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-    };
-    if (ctx->pending_render_fence >= 0) {
-        msg.msg_control = cmsg.buf;
-        msg.msg_controllen = sizeof(cmsg.buf);
-        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-        c->cmsg_level = SOL_SOCKET;
-        c->cmsg_type = SCM_RIGHTS;
-        c->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(c), &ctx->pending_render_fence, sizeof(int));
-    }
-    const ssize_t sent = sendmsg(ctx->fence_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
-    if (sent != (ssize_t)iov.iov_len) {
+    /* Keep the compositor thread nonblocking. In GPU mode we must have
+     * accepted the previous release dependency before completing this frame. */
+    if ((ctx->gpu_staging && (!ctx->gpu_started || ctx->gpu_expect_slot || ctx->slot_fence >= 0)) ||
+        send_frame_fence(ctx->fence_fd, DISPLAY_FENCE_RENDER_DONE,
+                         ctx->pending_render_fence) < 0) {
         enter_fallback(ctx);
         return -1;
     }
@@ -394,6 +375,8 @@ int trigger_refresh(display_ctx *ctx)
         close(ctx->pending_render_fence);
         ctx->pending_render_fence = -1;
     }
+    if (ctx->gpu_staging)
+        ctx->gpu_expect_slot = true;
     return 0;
 }
 
@@ -737,7 +720,7 @@ int poll_buffer_ready(display_ctx *ctx, int timeout_ms)
      * eventfd alone cannot report a consumer closing before its first target.
      * Only poll socket hangups: never steal input or ancillary bytes. */
     struct pollfd channels[] = {
-        {.fd = ctx->buf_ready_efd, .events = POLLIN},
+        {.fd = get_buffer_ready_fd(ctx), .events = POLLIN},
         {.fd = ctx->ctrl_fd, .events = POLLRDHUP},
         {.fd = ctx->data_fd, .events = POLLRDHUP},
     };
@@ -752,6 +735,58 @@ int poll_buffer_ready(display_ctx *ctx, int timeout_ms)
     if (!lost) return (channels[0].revents & POLLIN) != 0;
     enter_fallback(ctx);
     errno = error;
+    return -1;
+}
+
+void allow_gpu_staging(display_ctx *ctx, bool allow)
+{
+    if (ctx)
+        ctx->allow_gpu_staging = allow;
+}
+
+bool uses_gpu_staging(const display_ctx *ctx)
+{
+    return ctx && !ctx->fallback && ctx->gpu_staging;
+}
+
+int take_slot_fence(display_ctx *ctx)
+{
+    if (!uses_gpu_staging(ctx) || !ctx->gpu_started || ctx->gpu_expect_slot)
+        return -2;
+    const int fd = ctx->slot_fence;
+    ctx->slot_fence = -1;
+    return fd;
+}
+
+int read_buffer_ready(display_ctx *ctx)
+{
+    if (!ctx || ctx->fallback)
+        return 0;
+    if (!ctx->gpu_staging) {
+        eventfd_t value;
+        return eventfd_read(ctx->buf_ready_efd, &value) == 0;
+    }
+
+    unsigned char marker;
+    int fd;
+    const int rc = recv_frame_fence(ctx->fence_fd, &marker, &fd);
+    if (!rc)
+        return 0;
+    if (rc == 1 && ctx->gpu_expect_slot && ctx->slot_fence < 0 &&
+        ((marker == DISPLAY_FENCE_SLOT_READY && fd < 0) ||
+         (ctx->gpu_started && marker == DISPLAY_FENCE_SLOT_RELEASE && fd >= 0))) {
+        struct sync_file_info status = {0};
+        if (fd < 0 || (ioctl(fd, SYNC_IOC_FILE_INFO, &status) == 0 && status.status >= 0)) {
+            ctx->slot_fence = fd;
+            ctx->gpu_expect_slot = false;
+            ctx->gpu_started = true;
+            return 1;
+        }
+    }
+    if (fd >= 0)
+        close(fd);
+    enter_fallback(ctx);
+    errno = EPROTO;
     return -1;
 }
 void force_fallback(display_ctx *ctx)
@@ -784,6 +819,26 @@ int try_exit_fallback(display_ctx *ctx)
     rc=receive_dmabufs(ctx);
     if (rc < 0) goto consumer_failure;
     if (!rc) { errno=EAGAIN; return -1; }
+    /* The daemon only transfers the five v5 descriptors. Socket type is the
+     * in-band offer, so an old/unrelated producer never gets a GPU-only slot. */
+    int socket_type;
+    socklen_t length = sizeof(socket_type);
+    if (getsockopt(ctx->fence_fd, SOL_SOCKET, SO_TYPE, &socket_type, &length) < 0)
+        goto consumer_failure;
+    if (socket_type == SOCK_SEQPACKET) {
+        const struct buf_info *info = &ctx->dmabuf_infos[0];
+        if (!ctx->allow_gpu_staging || ctx->buf_count != 1 || info->format != 1 ||
+            info->modifier || info->offset || !info->width || !info->height ||
+            info->stride < (uint64_t)info->width * 4u || info->stride % 64u ||
+            send_frame_fence(ctx->fence_fd, DISPLAY_FENCE_GPU_READY, -1) < 0) {
+            errno = EPROTONOSUPPORT;
+            goto consumer_failure;
+        }
+        ctx->gpu_staging = ctx->gpu_expect_slot = true;
+    } else if (socket_type != SOCK_STREAM) {
+        errno = EPROTONOSUPPORT;
+        goto consumer_failure;
+    }
     ctx->fallback=false;
     return 0;
 
@@ -814,7 +869,7 @@ int get_audio_fd(display_ctx *ctx)
 
 int get_buffer_ready_fd(display_ctx *ctx)
 {
-    return ctx->buf_ready_efd;
+    return ctx->gpu_staging ? ctx->fence_fd : ctx->buf_ready_efd;
 }
 
 int get_buf_count(display_ctx *ctx)

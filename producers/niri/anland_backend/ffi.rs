@@ -3,7 +3,7 @@
 use std::ffi::{c_char, c_int, c_void};
 
 pub const MAX_BUFS: usize = 8;
-pub const EVENT_PRESENTED: u32 = 1;
+pub const EVENT_FRAME_CONSUMED: u32 = 6;
 pub const EVENT_BUFFER_RELEASED: u32 = 2;
 pub const EVENT_COMMIT_DROPPED: u32 = 3;
 pub const EVENT_OUTPUT_CHANGED: u32 = 4;
@@ -20,6 +20,7 @@ pub const INPUT_TYPE_TEXT_INPUT: u32 = 9;
 pub const INPUT_TYPE_RESOURCE: u32 = 11;
 pub const INPUT_TYPE_RESOURCE_INVALID: u32 = 12;
 pub const INPUT_TYPE_TABLET_FRAME: u32 = 16;
+pub const INPUT_TYPE_FRAME_PRESENTATION: u32 = 17;
 pub const INPUT_ACTION_DOWN: i32 = 0;
 pub const INPUT_ACTION_UP: i32 = 1;
 pub const INPUT_ACTION_MOVE: i32 = 2;
@@ -98,6 +99,8 @@ pub struct InputEvent {
     pub refresh_mhz: u32,
     pub tablet_previous: TabletSample,
     pub tablet_current: TabletSample,
+    pub presentation_serial: u64,
+    pub presentation_ns: u64,
 }
 #[repr(C)]
 #[derive(Default, Clone, Copy, Debug)]
@@ -128,6 +131,9 @@ extern "C" {
     pub fn anland_niri_drop_session(bridge: *mut Bridge);
     pub fn anland_niri_output_info(bridge: *mut Bridge, out: *mut Output) -> c_int;
     pub fn anland_niri_get_target(bridge: *mut Bridge, out: *mut Target) -> c_int;
+    pub fn anland_niri_allow_gpu_staging(bridge: *mut Bridge);
+    pub fn anland_niri_uses_gpu_staging(bridge: *mut Bridge) -> c_int;
+    pub fn anland_niri_take_slot_fence(bridge: *mut Bridge, generation: u64, index: u32) -> c_int;
     pub fn anland_niri_submit(
         bridge: *mut Bridge,
         generation: u64,

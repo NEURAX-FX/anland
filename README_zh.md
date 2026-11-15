@@ -31,6 +31,10 @@
 > **命名**: producer 生产像素内容，consumer 消费（显示）这些内容。consumer 是资源拥有者，
 > 因为它才是把缓冲区真正扫描输出到屏幕的一方。
 
+Android v5 消费端分配独立的单平面线性 RGBA8888 暂存 DMA-BUF，不导出 gralloc
+句柄，也不让生产端写入 Android 显示槽。兼容的 Niri/Zink/PanVK 与 Android Vulkan
+可直接共享暂存槽，不经 CPU 读取；其他会话保留 GLES 上传和 EGL 上屏。
+
 ---
 
 ## 2. V3 变更概览
@@ -339,9 +343,9 @@ void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event) {
 
 ## 7. 稳态帧循环
 
-双方退出 fallback 后，每一帧的交换都**不再经过守护进程**——通过共享 `shm` 页、
-`buf_ready_efd` 与**专用 fence 通道**（socketpair）完成。V3 在数据通道上新增了
-剪贴板交换，但这些是**异步的，不影响帧节奏**。
+稳态帧交换**不经过守护进程**。下图是传统的 `shm`、`buf_ready_efd` 和 fence 通道；
+GPU 暂存保留同一套 FD 交接，但选槽和归还改走双向 fence 通道。输入和剪贴板仍在独立的
+data 通道上。
 
 ```mermaid
 sequenceDiagram
@@ -350,7 +354,7 @@ sequenceDiagram
     participant SHM as shm index 索引页
     participant P as Producer 生产端
 
-    Note over C,P: one‑time, right after handshake 握手后一次性
+    Note over C,P: 每次会话只导出一次，先于首次选槽
     C->>P: BUFS_READY + dmabuf fds (data channel)
     P-->>P: import dmabufs 导入缓冲区
 
@@ -361,8 +365,11 @@ sequenceDiagram
         P-->>P: render into dmabuf[idx] 渲染到该缓冲区
         P-->>C: sendmsg(fence_fd, 1 byte ± fence fd via SCM_RIGHTS)  (trigger_refresh)
         C-->>C: recvmsg(fence_fd) → get fence fd 获取栅栏 fd (refresh_done)
-        C->>C: queueBuffer(fence_fd) → SurfaceFlinger waits GPU-side
+        C->>C: 等 fence、同步 CPU 读取、GLES 上传、释放暂存槽
+        C->>C: 绘制私有纹理并提交（可与 producer 渲染下一帧重叠）
     end
+
+    C-->>P: 可选 FRAME_PRESENTATION，携带 EGL 实际呈现时间（data 通道）
 
     Note over C,P: input flows the other way 输入反向流动
     C->>P: INPUT_EVENT (data channel, poll_input_event)
@@ -376,11 +383,30 @@ sequenceDiagram
     P-->>P: update RenderLoop pacing 调整渲染节拍
 ```
 
-- `select_dmabuf(idx)` → 写入下标并触发信号。
+- `select_dmabuf(idx)` 只在 producer 可接收时写入下标并触发信号；成功交接才返回 `0`。
 - producer 被唤醒后读下标、渲染、可选存 fence、再调用 `trigger_refresh()`。
 - `trigger_refresh()` 在 fence socketpair 上发送 1 字节 + 可选 SCM_RIGHTS fence fd。
-- `refresh_done()` 在 fence 通道上等待，**5 秒**超时即进入 fallback，
-  读取消息后返回 fence fd（或 `-1` 无 fence）。
+- `refresh_done(ctx, timeout_ms)` 不释放槽位。它返回由调用方持有的 fence fd、表示同步完成的
+  `-1`、本次等待超时的 `DISPLAY_FRAME_PENDING` 或会话失效的 `DISPLAY_FRAME_FAILED`。
+  5 秒未收到完成或 fence 失败时放弃本次会话；读完槽位才调用 `release_dmabuf()`。
+- `INPUT_TYPE_FRAME_PRESENTATION` 是可选的定长上报，序号在每次会话内从 1 开始，按渲染完成
+  消息计数。实际呈现时间来自 `VK_GOOGLE_display_timing` 或 `EGL_DISPLAY_PRESENT_TIME_ANDROID`；
+  时间为 0 或未上报时不阻塞渲染，也不视为已呈现。
+
+Android v5 在启动和刷新率变化时上报窗口当前可用的刷新率（mHz），Niri 在线更新输出模式
+和帧时钟，不需要重连，也不会主动请求切换安卓档位。`pacing` 日志分别记录窗口刷新率、
+成功提交帧率和由实际呈现时间戳确认的上屏帧率。
+
+**GPU 暂存（Niri/Zink/PanVK）。** `ANLAND_PANVK_ICD` 指向 Niri 的 Vulkan 已选用的
+kbase PanVK ICD 绝对路径。补丁只在导入握手确认的暂存 DMA-BUF 时请求
+`BASE_MEM_UNCACHED_GPU`，不应全局设置 `PANVK_KBASE_IMPORT_SET`。要让 Linux
+渲染 fence 也不在 CPU 等待，请关闭 Niri 的 `wait-for-frame-completion-before-queueing` 调试项。
+
+消费端通过原有 v5 FD 交接中的 `SOCK_SEQPACKET` fence 通道提出 GPU 模式。收到
+`FDS_READY` 和生产端的 GPU ACK 后，Linux 渲染到单个暂存槽，Android 导入渲染
+`SYNC_FD`，用 Vulkan 全屏绘制采样该槽，并在提交独立的 swapchain 图像前送回 release
+`SYNC_FD`。下一次 Linux 绘制在 GPU 上等这个依赖，不逐帧映射、同步 CPU 缓存或上传像素。
+没有 GPU ACK 或 Vulkan 不可用时，用新会话和新分配回退 EGL。
 
 ### 7.1 剪贴板交换（V3）
 
@@ -501,30 +527,23 @@ stateDiagram-v2
 
 ### 9.2 消费端状态机
 
-consumer 在 `connect_to_deamon()` 时创建资源并寄存，初始为 fallback。它**惰性**退出
-fallback：每次 `select_dmabuf()` 先调用 `try_exit_fallback()`，仅检查守护进程是否已转发
-`FDS_READY`（即刚有 producer 取走了 fd）。
+每个消费端会话只寄存一次通道，并通过独立的 data socket 导出暂存槽。首次选槽前须收到
+`FDS_READY`；GPU 模式还须收到生产端的 GPU ACK。握手未收全可重试；失效或格式错误不可重试。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Fallback: connect_to_deamon()<br/>create resources + deposit fds<br/>创建资源并寄存 fd
-
-    Fallback --> Fallback: no FDS_READY yet 暂无<br/>(select_dmabuf is a no‑op 空操作)
-    Fallback --> Connected: FDS_READY seen 收到通知<br/>→ push_dmabufs() 推送缓冲区
-
-    Connected --> Connected: select / refresh frames 选帧/呈现
-    Connected --> Fallback: send fail · 发送失败<br/>refresh timeout 5s · 刷新超时<br/>→ enter_fallback()
-
-    note right of Fallback
-        enter_fallback() rebuilds eventfd/socketpair/shm
-        and re‑sends CONSUMER_HELLO (re‑deposits)
-        重建 eventfd/socketpair/shm 并重新 HELLO 寄存
-    end note
+    [*] --> Waiting: 新会话和新暂存槽
+    Waiting --> Active: FDS_READY（GPU 模式还需 ACK）
+    Active --> Active: 选槽 / 完成 / 采样或上传 / 归还
+    Waiting --> Dead: 握手失败
+    Active --> Dead: 通道、fence 或呈现出错
+    Dead --> [*]: 关闭通道并丢弃暂存槽
 ```
 
-> [!NOTE]
-> **V3 新增**：consumer 提供 `set_exit_fallback_callback()`，允许宿主应用在 producer
-> 重连时作出反应（如启动事件线程、同步剪贴板）。这是**可选的**，不改变状态机。
+即使旧 producer 仍持有旧槽引用，重连也创建新会话和新缓冲区。
+
+Root 连接为每次 helper FD 交接创建独立的私有 socket。关闭窗口会取消等待，不必等 `su` 退出。
+消费端先提交首帧，再启动音频、剪贴板同步和可选的前台调度，避免这些服务阻塞画面启动。
 
 ---
 
@@ -533,7 +552,7 @@ stateDiagram-v2
 | 事件 | 检测方 | 反应 |
 |------|--------|------|
 | Producer 丢失 consumer | `POLLHUP`/`POLLERR` on `data_fd`, 或发送失败 | `enter_fallback()`: 释放 consumer 资源，触发回调，恢复 200 ms 重连定时器 |
-| Consumer 失去 producer | 发送失败或 5 秒 `refresh_done` 超时 | `enter_fallback()`: 拆除并重建 eventfd/socketpair/shm，重新发送 `CONSUMER_HELLO`（重新寄存） |
+| Consumer 失去 producer | 通道或帧完成失败 | 结束会话，用新通道和新暂存槽重连。 |
 | Consumer 会话中重连 | daemon 收到带 ≥3 fd 的 `CONSUMER_HELLO` | 替换已寄存的 fd；若有 producer 正在等待则立即交付 |
 | 任一端重连 | 新的 `*_HELLO` | daemon 释放该角色的旧连接并接纳新连接 |
 
@@ -541,12 +560,13 @@ stateDiagram-v2
 
 ## 11. 设计要点
 
-- **单一重连路径** — 启动与恢复都汇入 `try_exit_fallback()`，没有单独的"首次连接"逻辑
+- **失败后开启新会话** — 旧 producer 可能仍在写入，不能重新导出旧暂存槽。
 - **原子退出** — producer 必须同时拿到 fd 与 dmabuf 才退出 fallback，从而可立即导入并渲染
 - **守护进程不在热路径** — 它只负责握手，之后每帧仅用 shm + eventfd + fence 通道，零守护进程往返
 - **非阻塞握手** — 握手轮询采用较短的 100 ms 超时，保证无 consumer 时 producer 的重连循环仍然灵敏
 - **显示模式锁** — 以第一份 `screen_info` 为准，参数不符的 consumer 会被拒绝
-- **GPU 侧 fence 同步** — producer 通过 `SCM_RIGHTS` 传递真实的 dma-buf sync-file fence；consumer 将其交给 SurfaceFlinger，消除了 CPU 端 `glFinish()` 阻塞
+- **渲染 fence** — producer 通过 `SCM_RIGHTS` 传递 sync-file。消费端等 fence 后读取暂存
+  DMA-BUF；EGL 负责其窗口缓冲与 SurfaceFlinger 的同步。
 - **双向剪贴板（V3）** — 剪贴板数据通过数据通道双向流动，使用头部 + 负载两包协议。回声保护防止循环。变长事件要求所有接收者排空尾随负载
 - **必须排空协议** — 任何带变长负载的事件类型（目前为剪贴板）**必须**通过 `handle_unhandled_event()` 或 `*_extend_data()` 排空，即使调用者不关心数据。否则会损坏数据通道流
 
@@ -560,8 +580,8 @@ debug {
 }
 ```
 
-开启后会阻塞合成器等待当前帧，可能降低吞吐。默认仍把原生 acquire fence 交给
-Android，仅在无法导出 fence 时由合成器等待。
+开启后会阻塞合成器等待当前帧，可能降低吞吐。默认由 Android 消费端等 fence 后上传像素；
+不能导出 fence 时才由 Niri 等待。
 
 ---
 
@@ -586,24 +606,12 @@ Android，仅在无法导出 fence 时由合成器等待。
 
 > **Producer 不兼容说明**：V2 producer 的 `poll_input_event()` 签名不变但行为变化——V3 consumer 可能发送 `INPUT_TYPE_CLIPBOARD` 变长事件。不排空尾随负载会导致 data channel 流损坏。
 
-### 12.2 Consumer 库 (`libdisplay_consumer`) — **API 与 ABI 均不兼容**
+### 12.2 Consumer 库 (`libdisplay_consumer`)
 
-| 函数 | V2 | V3 | 兼容性 |
-|------|----|----|--------|
-| `connect_to_deamon()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `refresh_done()` | 返回 fence fd (>=0 or -1) | 相同签名 | ✅ 不变 |
-| `push_dmabufs()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `select_dmabuf()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `set_screen_info()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `set_fallback_callback()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `disconnect()` | 相同签名 | 相同签名 | ✅ 不变 |
-| `push_input_event()` | 相同签名 | 相同签名 | ⚠️ **不得用于剪贴板**（变长事件必须用 `push_input_event_with_length()`） |
-| `poll_output_event()` | — | **V3 新增**：轮询 producer→consumer 输出事件 | ✅ 新增 API |
-| `push_input_event_with_length()` | — | **V3 新增**：发送变长输入事件（剪贴板） | ✅ 新增 API |
-| `poll_output_event_extend_data()` | — | **V3 新增**：排空变长输出事件的尾随负载 | ✅ 新增 API |
-| `set_exit_fallback_callback()` | — | **V3 新增**：producer 重连时回调 | ✅ 新增 API |
-| `get_data_fd()` | — | **V3 新增**：获取 data channel fd | ✅ 新增 API |
-| `handle_unhandled_event()` | — | **V3 新增**：排空未处理的变长事件 | ❌ **必须调用**：收到未处理的变长事件时必须调用以排空流 |
+v5 消费端 API 按会话管理。`push_dmabufs()` 每个会话只导出一次缓冲池；
+`refresh_done(ctx, timeout_ms)` 保留槽位，直到调用 `release_dmabuf()`。
+`abort_display_session()` 唤醒阻塞的 I/O，等待线程退出后再调用 `disconnect()`。
+当前接口见 `display_consumer.h`，此路径不再使用旧的 fallback 回调。
 
 > **Consumer 不兼容说明**：V3 producer 可能发送 `DATA_MSG_OUTPUT_EVENT`（103）+ 剪贴板变长负载。V2 consumer 没有 `poll_output_event()`，无法读取这些消息，导致 data channel 流损坏。
 

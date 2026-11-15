@@ -29,6 +29,7 @@ typedef struct anland_niri_input {
     uint32_t payload_size, resource_type, fd_count;
     uint32_t refresh_mhz;
     anland_tablet_sample tablet_previous, tablet_current;
+    uint64_t presentation_serial, presentation_ns;
 } anland_niri_input;
 
 /* Shared in-process presentation lifecycle over the daemon transport.
@@ -45,6 +46,10 @@ void anland_niri_drop_session(anland_niri_bridge *bridge);
 int anland_niri_output_info(anland_niri_bridge *bridge, anland_niri_output *out);
 /* The target fd belongs to the caller; generation must be rechecked at submit. */
 int anland_niri_get_target(anland_niri_bridge *bridge, anland_niri_target *out);
+void anland_niri_allow_gpu_staging(anland_niri_bridge *bridge);
+int anland_niri_uses_gpu_staging(anland_niri_bridge *bridge);
+/* For the current target only. Returns an owned fd, -1 if complete, -2 on error. */
+int anland_niri_take_slot_fence(anland_niri_bridge *bridge, uint64_t generation, uint32_t index);
 /* The fence is BORROWED; submit duplicates it when necessary. */
 int anland_niri_submit(anland_niri_bridge *bridge, uint64_t generation,
                        uint32_t index, int acquire_fence_fd, uint64_t *commit_id);
