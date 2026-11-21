@@ -859,6 +859,19 @@ int get_data_fd(display_ctx *ctx)
     return ctx->data_fd;
 }
 
+int get_handshake_fd(display_ctx *ctx)
+{
+    if (!ctx)
+        return -1;
+    return ctx->data_fd >= 0 ? ctx->data_fd : ctx->ctrl_fd;
+}
+
+bool handshake_needs_write(display_ctx *ctx)
+{
+    return ctx && ctx->fallback && ctx->have_screen_info && ctx->data_fd < 0 &&
+           ctx->pickup_sent < sizeof(struct ctrl_msg);
+}
+
 /* Current local end of the audio socketpair, or -1 in fallback. The value changes
  * across reconnects (each pickup installs a fresh socket), so the audio engine must
  * be re-pointed via anland_audio_set_fd() rather than caching it. */

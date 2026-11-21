@@ -66,6 +66,14 @@ pub struct Target {
     pub fd: c_int,
 }
 #[repr(C)]
+#[derive(Default)]
+pub struct WatchFds {
+    pub generation: u64,
+    pub socket_fd: c_int,
+    pub ready_fd: c_int,
+    pub socket_writable: c_int,
+}
+#[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct SceneEvent {
     pub type_: u32,
@@ -128,6 +136,11 @@ extern "C" {
     pub fn anland_niri_connected(bridge: *mut Bridge) -> c_int;
     pub fn anland_niri_daemon_alive(bridge: *mut Bridge) -> c_int;
     pub fn anland_niri_generation(bridge: *mut Bridge) -> u64;
+    pub fn anland_niri_get_watch_fds(
+        bridge: *mut Bridge,
+        known_generation: u64,
+        out: *mut WatchFds,
+    ) -> c_int;
     pub fn anland_niri_drop_session(bridge: *mut Bridge);
     pub fn anland_niri_output_info(bridge: *mut Bridge, out: *mut Output) -> c_int;
     pub fn anland_niri_get_target(bridge: *mut Bridge, out: *mut Target) -> c_int;

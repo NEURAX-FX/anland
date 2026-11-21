@@ -142,6 +142,12 @@ void force_fallback(display_ctx *ctx);
 int  try_exit_fallback(display_ctx *ctx);
 
 int  get_data_fd(display_ctx *ctx);
+/* Socket used by the next handshake record: control until PICKUP_FDS transfers
+ * the data channel, then data. Borrowed; callers may watch but must not read. */
+int  get_handshake_fd(display_ctx *ctx);
+/* Only PICKUP_FDS writes need writable interest; do not watch writability
+ * while waiting for peer records or an active consumer would busy-loop. */
+bool handshake_needs_write(display_ctx *ctx);
 /* Current local end of the audio socketpair, or -1 in fallback. Changes across
  * reconnects; re-point the audio engine on each exit/enter fallback. */
 int  get_audio_fd(display_ctx *ctx);

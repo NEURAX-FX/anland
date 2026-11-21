@@ -433,20 +433,35 @@ int anland_scene_legacy_reconnect(anland_scene_legacy *b)
     return anland_scene_legacy_pump(b, 0);
 }
 
-int anland_scene_legacy_reopen(anland_scene_legacy *b, const char *socket_path)
+static int legacy_reopen_mode(anland_scene_legacy *b, const char *socket_path,
+                              bool deferred)
 {
     if (!b)
         return -1;
 
-    /* Close any adapter-owned fence and invalidate scene work before replacing
-     * the transport context. The scene/layer objects deliberately survive. */
+    /* Close adapter-owned fences and invalidate scene work before replacing
+     * transport state. Public scene/layer identities remain stable. */
     drop_session(b);
     anland_device_force_fallback(b->dev);
-    if (anland_device_reopen(b->dev, socket_path) != 0)
+    const int rc = deferred ?
+        anland_device_reopen_deferred(b->dev, socket_path) :
+        anland_device_reopen(b->dev, socket_path);
+    if (rc != 0)
         return -1;
 
     b->have_output = false;
     return 0;
+}
+
+int anland_scene_legacy_reopen(anland_scene_legacy *b, const char *socket_path)
+{
+    return legacy_reopen_mode(b, socket_path, false);
+}
+
+int anland_scene_legacy_reopen_deferred(anland_scene_legacy *b,
+                                        const char *socket_path)
+{
+    return legacy_reopen_mode(b, socket_path, true);
 }
 
 void anland_scene_legacy_drop_session(anland_scene_legacy *b)

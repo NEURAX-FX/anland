@@ -326,6 +326,20 @@ int anland_de_backend_reopen(anland_de_backend *backend, const char *endpoint)
         clear_display_cache(backend);
     return rc;
 }
+
+int anland_de_backend_reopen_deferred(anland_de_backend *backend,
+                                      const char *endpoint)
+{
+    if (!backend)
+        return -1;
+    anland_scene *scene = anland_present_scene(backend->present);
+    const uint64_t before = anland_scene_generation(scene);
+    const int rc = anland_present_reopen_deferred(backend->present, endpoint);
+    if (!anland_present_connected(backend->present) ||
+        anland_scene_generation(scene) != before)
+        clear_display_cache(backend);
+    return rc;
+}
 void anland_de_backend_drop_session(anland_de_backend *backend)
 {
     if (!backend)

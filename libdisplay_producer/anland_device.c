@@ -216,19 +216,21 @@ bool anland_device_is_daemon_alive(const anland_device *dev)
     return dev && is_daemon_alive(dev->ctx);
 }
 
-int anland_device_reopen(anland_device *dev, const char *socket_path)
+static int device_reopen_mode(anland_device *dev, const char *socket_path,
+                              bool deferred)
 {
     if (!dev)
         return -1;
 
     const char *path = (socket_path && *socket_path) ? socket_path : dev->socket_path;
-    display_ctx *ctx = try_socket_mode(path, dev->deferred);
+    display_ctx *ctx = try_socket_mode(path, deferred);
     if (!ctx)
         return -1;
 
     disconnect(dev->ctx);
     dev->ctx = ctx;
     allow_gpu_staging(ctx, dev->allow_gpu_staging);
+    dev->deferred = deferred;
     dev->pending_fb = -1;
     snprintf(dev->socket_path, sizeof(dev->socket_path), "%s", path ? path : "");
 
@@ -238,6 +240,18 @@ int anland_device_reopen(anland_device *dev, const char *socket_path)
     set_fallback_callback(dev->ctx, dev->fallback_cb, dev->fallback_userdata);
     set_pre_release_callback(dev->ctx, dev->pre_release_cb, dev->pre_release_userdata);
     return 0;
+}
+
+int anland_device_reopen(anland_device *dev, const char *socket_path)
+{
+    return device_reopen_mode(dev, socket_path, dev ? dev->deferred : false);
+}
+
+int anland_device_reopen_deferred(anland_device *dev, const char *socket_path)
+{
+    /* Reconnect callers must not block the compositor while waiting for the
+     * consumer to publish SCREEN_INFO. The staged handshake continues on fd readiness. */
+    return device_reopen_mode(dev, socket_path, true);
 }
 
 void anland_device_set_fallback_cb(anland_device *dev,
@@ -268,11 +282,23 @@ int anland_device_data_fd(anland_device *dev)
     return get_data_fd(dev->ctx);
 }
 
+int anland_device_handshake_fd(anland_device *dev)
+{
+    if (!dev || !is_daemon_alive(dev->ctx))
+        return -1;
+    return get_handshake_fd(dev->ctx);
+}
+
 int anland_device_buffer_ready_fd(anland_device *dev)
 {
     if (!dev)
         return -1;
     return get_buffer_ready_fd(dev->ctx);
+}
+
+bool anland_device_handshake_needs_write(anland_device *dev)
+{
+    return dev && handshake_needs_write(dev->ctx);
 }
 
 int anland_device_audio_fd(anland_device *dev)

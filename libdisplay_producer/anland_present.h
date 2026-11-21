@@ -47,6 +47,7 @@ bool anland_present_renderable(const anland_present *present);
  * consumer session requires the WM to re-import its framebuffer set. */
 int anland_present_reconnect(anland_present *present);
 int anland_present_reopen(anland_present *present, const char *endpoint);
+int anland_present_reopen_deferred(anland_present *present, const char *endpoint);
 void anland_present_drop_session(anland_present *present);
 
 /* Handoff an accepted transaction, then process consumer acknowledgements.

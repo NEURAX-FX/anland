@@ -495,7 +495,7 @@ sequenceDiagram
 ### 9.1 生产端状态机
 
 `connect_to_deamon()` **只**完成守护进程握手（取得 `screen_info`），随后刻意停留在
-fallback。backend 再以定时器（`RECONNECT_INTERVAL_MS = 200 ms`）轮询 `try_exit_fallback()`。
+fallback。Niri 通过 socket 就绪事件推进握手；其余 adapter 保留各自的定时策略。
 
 ```mermaid
 stateDiagram-v2
@@ -504,26 +504,46 @@ stateDiagram-v2
     Disconnected --> Fallback: connect_to_deamon() OK<br/>got screen_info 取得屏幕参数
     Disconnected --> [*]: connect failed 连接失败
 
-    Fallback --> Fallback: try_exit_fallback() == -1<br/>no consumer yet · 无 consumer<br/>wait 200ms then retry 等待后重试
+    Fallback --> Fallback: 握手尚未完成<br/>等待 socket 就绪或 adapter 定时器
     Fallback --> Connected: try_exit_fallback() == 0<br/>fds + dmabufs in hand 拿到 fd 与缓冲区
 
     Connected --> Connected: render frames 渲染帧
     Connected --> Fallback: consumer lost 对端丢失<br/>POLLHUP / send fail → enter_fallback()
 
     note right of Fallback
-        timer polls every 200ms
-        定时器每 200ms 轮询一次
+        Niri 等待 socket 就绪
+        其他 adapter 可用 200ms 定时器
     end note
 ```
 
-`try_exit_fallback()` 是**两步且原子**的——只有两步**都**成功才会清除 fallback
-（见 `display_producer.c`）：
+`try_exit_fallback()` 是非阻塞分阶段握手：先接收 `FDS_READY` 和五个 fd
+`{buf_ready, fence, data, shm, audio}`，再接收 data 通道上的缓冲区元数据和 fd。
+`EAGAIN` 保留半包及 fd，不是断线；只有传输或协议错误才废弃本次尝试。元数据齐全
+仍需真实选槽信号，GPU 模式的 fence 及缓存策略不变。
 
-1. **`pickup_fds()`** — 发送 `PICKUP_FDS`，轮询 `ctrl_fd` (100 ms) 等待 `FDS_READY`，
-   收到 4 个 fd 并 `mmap` 索引页。
-2. **`receive_dmabufs()`** — 轮询 `data_fd` (100 ms) 等待 `BUFS_READY`，保存缓冲区集合。
+Niri 已移除 1 ms 重连轮询：未完成的 `PICKUP_FDS` 监听可写，其余握手监听可读，
+活跃会话另监听 buffer-ready。真正断线才采用 100 ms 起步、翻倍至 2 s 的退避，
+退避期间移除旧 fd 监听；50 ms housekeeping 不重试正常等待中的握手。重开守护
+进程后延后等待 `SCREEN_INFO`，不阻塞主线程。其他 WM 的严格 reopen 行为不变。
 
-任意步骤失败 → `release_consumer_resources()` 并留在 fallback，可在下一拍安全重试。
+### MT6989 用户态部署记录
+
+2026-11-21 已将保留 GPU-staging 的 ARM64 Niri 和配套两份 producer 库替换到
+`/opt/anland/gpu-staging-619719b9/`，并执行 `systemctl --user restart niri.service`。
+服务启动为 `active/running`，Niri PID 为 9626，IPC 输出为 2392×1080、120000 mHz。
+启动后的 5 次一秒 `pidstat` 采样平均 CPU 为 0.60%（单个逻辑核为 100%）；这不是
+FPS 或长时间负载基准。PanVK ICD、ICD selector、Niri 配置及内核保持不变。
+
+替换前副本和已语法检查的回滚脚本保存在
+`/root/panvk-wsi-debug/backup-niri-gpu-idle-30586c15/`：
+
+```sh
+bash /root/panvk-wsi-debug/backup-niri-gpu-idle-30586c15/rollback.sh
+```
+
+回滚只恢复这三个用户态文件并重启同一服务，遇到更新的运行文件会拒绝覆盖。回滚脚本
+未实际执行。启动日志与 IPC 已验证；Android 截图工具因缺少 `libGBDumper.so` 无法
+运行，未据此声称已验证设备画面。
 
 ### 9.2 消费端状态机
 

@@ -33,6 +33,22 @@ else()
     pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
     add_subdirectory(libdisplay_producer)
 
+    if(BUILD_TESTING)
+        add_executable(anland_niri_readiness_test
+            libdisplay_producer/tests/niri_readiness_test.c)
+        target_include_directories(anland_niri_readiness_test PRIVATE
+            producers/niri/anland_backend)
+        if(TARGET anland_niri_bridge)
+            target_link_libraries(anland_niri_readiness_test PRIVATE anland_niri_bridge)
+        else()
+            target_sources(anland_niri_readiness_test PRIVATE
+                producers/niri/anland_backend/anland_niri_bridge.c)
+        endif()
+        target_link_libraries(anland_niri_readiness_test PRIVATE display_producer pthread)
+        add_test(NAME native_niri_readiness COMMAND anland_niri_readiness_test)
+        set_tests_properties(native_niri_readiness PROPERTIES TIMEOUT 20)
+    endif()
+
     add_library(display_consumer SHARED libdisplay_consumer/display_consumer.c)
     target_link_libraries(display_consumer socket_utils pthread)
 

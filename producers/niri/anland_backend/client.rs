@@ -45,6 +45,13 @@ pub struct Event {
     pub release_fence: Option<OwnedFd>,
 }
 
+pub struct WatchFds {
+    pub generation: u64,
+    pub socket_fd: Option<OwnedFd>,
+    pub ready_fd: Option<OwnedFd>,
+    pub socket_writable: bool,
+}
+
 impl Client {
     pub fn open(socket: &str) -> io::Result<Self> {
         let socket = CString::new(socket).map_err(|_| failed("invalid socket name"))?;
@@ -63,7 +70,7 @@ impl Client {
 
     pub fn reconnect(&mut self) -> io::Result<()> {
         if unsafe { ffi::anland_niri_reconnect(self.0.as_ptr()) } != 0 {
-            return Err(failed("reconnect"));
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
@@ -74,6 +81,21 @@ impl Client {
             return Err(failed("reopen"));
         }
         Ok(())
+    }
+
+    pub fn watch_fds(&mut self, known_generation: u64) -> io::Result<WatchFds> {
+        let mut raw = ffi::WatchFds::default();
+        if unsafe {
+            ffi::anland_niri_get_watch_fds(self.0.as_ptr(), known_generation, &mut raw)
+        } < 0 {
+            return Err(failed("get watch fds"));
+        }
+        Ok(WatchFds {
+            generation: raw.generation,
+            socket_fd: (raw.socket_fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw.socket_fd) }),
+            ready_fd: (raw.ready_fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw.ready_fd) }),
+            socket_writable: raw.socket_writable != 0,
+        })
     }
 
     pub fn connected(&self) -> bool {

@@ -99,6 +99,10 @@ int anland_scene_legacy_reconnect(anland_scene_legacy *b);
  * layers. Pending and in-flight work is invalidated before the old connection is
  * discarded, so no stale fence or commit can survive into the new session. */
 int anland_scene_legacy_reopen(anland_scene_legacy *b, const char *socket_path);
+/* Deferred variant: HELLO returns without waiting for SCREEN_INFO; the caller
+ * must retry the staged handshake from its readable-socket callback. */
+int anland_scene_legacy_reopen_deferred(anland_scene_legacy *b,
+                                        const char *socket_path);
 
 /* Abandon the current consumer session on purpose: drop any accepted / in-flight
  * frame (the DE receives COMMIT_DROPPED + BUFFER_RELEASED for its buffers) and

@@ -221,6 +221,9 @@ bool anland_device_is_daemon_alive(const anland_device *dev);
  * the object remains valid for scene/layer owners. Returns 0 when the daemon
  * handshake succeeds; the device stays disconnected and remains retryable on -1. */
 int anland_device_reopen(anland_device *dev, const char *socket_path);
+/* Reopen without waiting for SCREEN_INFO; compositor event loops should use
+ * this so a daemon restart cannot block the main thread. */
+int anland_device_reopen_deferred(anland_device *dev, const char *socket_path);
 
 void anland_device_set_fallback_cb(anland_device *dev,
                                    anland_device_fallback_cb cb, void *userdata);
@@ -239,6 +242,10 @@ void anland_device_set_pre_release_cb(anland_device *dev,
 
 /* Data channel fd (consumer input / our output events). */
 int anland_device_data_fd(anland_device *dev);
+/* Daemon handshake socket (control, then data after fd pickup). Borrowed and
+ * for readiness watching only; never read it outside the transport. */
+int anland_device_handshake_fd(anland_device *dev);
+bool anland_device_handshake_needs_write(anland_device *dev);
 /* Readable on target selection: legacy eventfd or negotiated fence socket. */
 int anland_device_buffer_ready_fd(anland_device *dev);
 int anland_device_read_buffer_ready(anland_device *dev);

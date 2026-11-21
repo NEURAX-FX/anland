@@ -64,6 +64,11 @@ int anland_present_reopen(anland_present *present, const char *endpoint)
     return present ? anland_scene_legacy_reopen(present->transport, endpoint) : -1;
 }
 
+int anland_present_reopen_deferred(anland_present *present, const char *endpoint)
+{
+    return present ? anland_scene_legacy_reopen_deferred(present->transport, endpoint) : -1;
+}
+
 void anland_present_drop_session(anland_present *present)
 {
     if (present)

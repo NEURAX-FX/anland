@@ -101,6 +101,8 @@ int anland_de_backend_dispatch(anland_de_backend *backend,
 int anland_de_backend_pump(anland_de_backend *backend, int timeout_ms);
 int anland_de_backend_reconnect(anland_de_backend *backend);
 int anland_de_backend_reopen(anland_de_backend *backend, const char *endpoint);
+int anland_de_backend_reopen_deferred(anland_de_backend *backend,
+                                      const char *endpoint);
 void anland_de_backend_drop_session(anland_de_backend *backend);
 /* Borrowed handles owned by the presentation backend. They remain valid until
  * anland_de_backend_destroy(); DE adapters must not destroy them directly. */

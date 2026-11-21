@@ -10,6 +10,7 @@ pub mod frame_state;
 pub mod input;
 mod clipboard;
 mod gpu_staging;
+mod reconnect;
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::input::keyboard::xkb;
 
@@ -18,7 +19,7 @@ use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use niri_config::OutputName;
@@ -32,6 +33,9 @@ use smithay::backend::renderer::gles::{Capability, GlesRenderer};
 use smithay::backend::renderer::{Bind, Color32F, ImportDma};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::calloop::{
+    generic::{Generic, NoIoDrop}, Interest, Mode as CalloopMode, PostAction, RegistrationToken,
+};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::utils::Size;
@@ -42,13 +46,14 @@ use smithay::wayland::seat::WaylandFocus;
 use smithay::reexports::wayland_server::Resource;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
-use crate::niri::{Niri, RedrawState};
+use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
 
-/// Poll for transport progress and input without treating a buffer-ready wakeup
-/// as a display vsync. The lockstep producer waits for the consumer's selection.
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// Housekeeping cadence for animations, clipboard completions and input that
+/// arrives without a transport readiness transition. Transport progress uses
+/// fd readiness sources; this timer is not the reconnect loop.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long a new consumer buffer size must remain unchanged before it becomes
 /// the output mode. Android can briefly alternate portrait and landscape
@@ -221,6 +226,10 @@ pub struct Anland {
     clipboard_worker_running: bool,
     clipboard_read_pending: bool,
     disposed: bool,
+    watch_generation: u64,
+    watch_socket_token: Option<RegistrationToken>,
+    watch_ready_token: Option<RegistrationToken>,
+    reconnect: reconnect::Reconnect,
 }
 
 unsafe impl Send for Anland {}
@@ -240,9 +249,8 @@ impl Anland {
             std::env::var("ANLAND_SOCKET").unwrap_or_else(|_| "/run/display.sock".to_string());
         let mut client = client::Client::open(&socket_path)
             .context("error opening common producer device")?;
-        // Do not reconnect before the event loop exists. The first timer tick
-        // establishes the session, records its generation, then dispatches
-        // OUTPUT_CHANGED/RENDER_TARGET_READY without losing the first target.
+        // The first writable-socket callback establishes the consumer session
+        // after the event loop exists, without dropping its first target.
         let initial = client.output().context("no output description from daemon")?;
         let (width, height, refresh) =
             (initial.width.max(1), initial.height.max(1), initial.refresh_mhz.max(1));
@@ -288,7 +296,74 @@ impl Anland {
             clipboard_worker_running: false,
             clipboard_read_pending: false,
             disposed: false,
+            watch_generation: 0,
+            watch_socket_token: None,
+            watch_ready_token: None,
+            reconnect: reconnect::Reconnect::new(),
         })
+    }
+
+    /// Re-register duplicated transport handles after the control/data or
+    /// buffer-ready descriptor changes across a session transition.
+    fn refresh_watch_sources(
+        &mut self,
+        handle: &smithay::reexports::calloop::LoopHandle<'static, State>,
+    ) {
+        if self.reconnect.backing_off() {
+            self.clear_watch_sources(handle);
+            return;
+        }
+        let snapshot = match self.client.watch_fds(self.watch_generation) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                self.clear_watch_sources(handle);
+                self.client.drop_session();
+                self.reconnect.failed(Instant::now());
+                warn!("anland: transport watch snapshot: {err}");
+                return;
+            }
+        };
+        if snapshot.generation == self.watch_generation {
+            return;
+        }
+
+        self.clear_watch_sources(handle);
+        self.watch_generation = snapshot.generation;
+
+        let interest = if snapshot.socket_writable { Interest::WRITE } else { Interest::READ };
+        if let Some(fd) = snapshot.socket_fd {
+            self.watch_socket_token = Some(
+                handle
+                    .insert_source(
+                        Generic::new(fd, interest, CalloopMode::Level),
+                        transport_ready,
+                    )
+                    .expect("failed to insert Anland handshake source"),
+            );
+        }
+        if let Some(fd) = snapshot.ready_fd {
+            self.watch_ready_token = Some(
+                handle
+                    .insert_source(
+                        Generic::new(fd, Interest::READ, CalloopMode::Level),
+                        transport_ready,
+                    )
+                    .expect("failed to insert Anland buffer-ready source"),
+            );
+        }
+    }
+
+    fn clear_watch_sources(
+        &mut self,
+        handle: &smithay::reexports::calloop::LoopHandle<'static, State>,
+    ) {
+        if let Some(token) = self.watch_socket_token.take() {
+            handle.remove(token);
+        }
+        if let Some(token) = self.watch_ready_token.take() {
+            handle.remove(token);
+        }
+        self.watch_generation = 0;
     }
 
     /// Invalidate synchronously, including cleared and non-text selections.
@@ -321,33 +396,16 @@ impl Anland {
             warn!("anland: failed to start camera engine");
         }
 
-        let timer = Timer::from_duration(POLL_INTERVAL);
+        let loop_handle = niri.event_loop.clone();
+        self.refresh_watch_sources(&loop_handle);
+
+        let timer = Timer::from_duration(HOUSEKEEPING_INTERVAL);
         niri.event_loop
             .insert_source(timer, move |_, _, state| {
-                // Reconnect and buffer-ready handling.
-                state.backend.anland().poll(&mut state.niri);
-
-                // Drain pending input events from the consumer.
-                while let Some(event) = state.backend.anland().poll_input(&mut state.niri) {
-                    state.process_input_event(event);
-                }
-
-                // Deliver fallback text from the complete State, bypassing niri's
-                // shortcut dispatcher while addressing only keyboard focus.
-                while let Some(symbols) = state.backend.anland().pending_text_keysyms.pop_front() {
-                    if let Some(keyboard) = state.niri.seat.get_keyboard() {
-                        // Smithay assigns at most 247 temporary keycodes (9..=255)
-                        // per keymap. Send every chunk rather than silently
-                        // truncating long Android commitText() batches.
-                        for chunk in symbols.chunks(247) {
-                            keyboard.inject_text_keysyms(state, chunk);
-                        }
-                    }
-                }
-                state.refresh_and_flush_clients();
-                TimeoutAction::ToDuration(POLL_INTERVAL)
+                service(state, false);
+                TimeoutAction::ToDuration(HOUSEKEEPING_INTERVAL)
             })
-            .expect("failed to insert anland poll timer");
+            .expect("failed to insert Anland housekeeping timer");
     }
 
     /// Advertises the DRM render node to wayland clients via the dmabuf
@@ -553,23 +611,53 @@ impl Anland {
         self.renderer.as_mut().map(f)
     }
 
-    /// Polls the consumer: drains input events, checks buffer-ready, and attempts
-    /// a reconnect if we fell back. Called from the poll timer.
-    pub fn poll(&mut self, niri: &mut Niri) {
-        if let Err(err) = self.client.pump() {
-            warn!("anland: presentation pump: {err}");
+    /// Pending records advance only on fd readiness; real failures back off.
+    fn poll(&mut self, niri: &mut Niri, transport_ready: bool) {
+        if self.client.connected() {
+            // Also retry consumed ACK publication and detect daemon loss from
+            // housekeeping, even if no further buffer-ready signal is due.
+            if let Err(err) = self.client.pump() {
+                warn!("anland: presentation pump: {err}");
+            }
         }
+
         if !self.client.connected() {
             self.on_session_lost(niri);
-            if !self.client.daemon_alive() {
-                let _ = self.client.reopen(&self.socket_path);
+            // Releases/outcomes must drain before the next handshake reuses ids.
+            self.dispatch_scene(niri);
+            let now = Instant::now();
+            let daemon_alive = self.client.daemon_alive();
+            if self.reconnect.waiting() && !daemon_alive {
+                self.reconnect.failed(now);
             }
-            if self.client.reconnect().is_ok() {
-                self.on_reconnect(niri);
+            if self.reconnect.should_attempt(now, transport_ready) {
+                if !daemon_alive && self.client.reopen(&self.socket_path).is_err() {
+                    self.reconnect.failed(now);
+                } else {
+                    match self.client.reconnect() {
+                        Ok(()) => {
+                            self.on_reconnect(niri);
+                            if self.client.connected() {
+                                self.reconnect.connected();
+                            } else {
+                                self.reconnect.failed(now);
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            self.reconnect.pending();
+                        }
+                        Err(err) => {
+                            warn!("anland: reconnect: {err}");
+                            self.client.drop_session();
+                            self.reconnect.failed(now);
+                        }
+                    }
+                }
             }
         }
         self.dispatch_scene(niri);
         self.presentation_reports.expire(get_monotonic_time());
+
         if self.selection_rx.try_recv().is_ok() {
             self.clipboard_read_pending = true;
         }
@@ -639,6 +727,7 @@ impl Anland {
         self.sent_scheduling_pid = None;
         self.sent_capture_mouse = None;
         if self.session_generation.take().is_none() { return; }
+        self.reconnect.failed(Instant::now());
         self.input_backend.queue_tablet_releases();
         self.client.reset_input();
         self.pending_input_releases.extend(self.input_backend.take_releases());
@@ -1232,6 +1321,37 @@ impl Anland {
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
         self.ipc_outputs.clone()
     }
+}
+
+fn service(state: &mut State, transport_ready: bool) {
+    let loop_handle = state.niri.event_loop.clone();
+    state.backend.anland().poll(&mut state.niri, transport_ready);
+
+    while let Some(event) = state.backend.anland().poll_input(&mut state.niri) {
+        state.process_input_event(event);
+    }
+
+    while let Some(symbols) = state.backend.anland().pending_text_keysyms.pop_front() {
+        if let Some(keyboard) = state.niri.seat.get_keyboard() {
+            for chunk in symbols.chunks(247) {
+                keyboard.inject_text_keysyms(state, chunk);
+            }
+        }
+    }
+
+    state.refresh_and_flush_clients();
+    state.backend.anland().refresh_watch_sources(&loop_handle);
+}
+
+fn transport_ready(
+    readiness: smithay::reexports::calloop::Readiness,
+    _fd: &mut NoIoDrop<OwnedFd>,
+    state: &mut State,
+) -> Result<PostAction, std::io::Error> {
+    if readiness.readable || readiness.writable || readiness.error {
+        service(state, true);
+    }
+    Ok(PostAction::Continue)
 }
 
 impl Drop for Anland {

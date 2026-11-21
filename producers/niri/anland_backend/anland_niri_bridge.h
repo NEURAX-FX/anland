@@ -44,6 +44,17 @@ int anland_niri_daemon_alive(anland_niri_bridge *bridge);
 uint64_t anland_niri_generation(anland_niri_bridge *bridge);
 void anland_niri_drop_session(anland_niri_bridge *bridge);
 int anland_niri_output_info(anland_niri_bridge *bridge, anland_niri_output *out);
+/* Readiness handles are duplicated and owned by the caller. When the supplied
+ * generation is current, no descriptors are duplicated. */
+typedef struct anland_niri_watch_fds {
+    uint64_t generation;
+    int socket_fd;
+    int ready_fd;
+    int socket_writable;
+} anland_niri_watch_fds;
+int anland_niri_get_watch_fds(anland_niri_bridge *bridge,
+                              uint64_t known_generation,
+                              anland_niri_watch_fds *out);
 /* The target fd belongs to the caller; generation must be rechecked at submit. */
 int anland_niri_get_target(anland_niri_bridge *bridge, anland_niri_target *out);
 void anland_niri_allow_gpu_staging(anland_niri_bridge *bridge);

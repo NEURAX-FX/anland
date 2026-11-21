@@ -2,6 +2,7 @@
 #include "anland_de_backend.h"
 #include "bounded_input_read.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -10,11 +11,32 @@ struct anland_niri_bridge {
     anland_de_backend *backend;
     uint64_t layer;
     anland_tablet tablet;
+    uint64_t watch_generation;
+    int watched_socket_fd;
+    int watched_ready_fd;
+    bool watched_socket_writable;
 };
 
 static anland_device *device(anland_niri_bridge *b)
 {
     return b ? anland_de_backend_device(b->backend) : NULL;
+}
+
+static void update_watch_generation(anland_niri_bridge *b)
+{
+    anland_device *dev = device(b);
+    const int socket_fd = anland_device_handshake_fd(dev);
+    const int ready_fd = dev && anland_device_is_connected(dev) ?
+                         anland_device_buffer_ready_fd(dev) : -1;
+    const bool writable = anland_device_handshake_needs_write(dev);
+    if (socket_fd != b->watched_socket_fd || ready_fd != b->watched_ready_fd ||
+        writable != b->watched_socket_writable) {
+        b->watched_socket_fd = socket_fd;
+        b->watched_ready_fd = ready_fd;
+        b->watched_socket_writable = writable;
+        if (++b->watch_generation == 0)
+            ++b->watch_generation;
+    }
 }
 
 anland_niri_bridge *anland_niri_open(const char *endpoint)
@@ -26,12 +48,16 @@ anland_niri_bridge *anland_niri_open(const char *endpoint)
     anland_niri_bridge *b = calloc(1, sizeof(*b));
     if (!b)
         return NULL;
+    b->watch_generation = 1;
+    b->watched_socket_fd = -2;
+    b->watched_ready_fd = -2;
     b->backend = anland_de_backend_create(&cfg);
     if (!b->backend) {
         free(b);
         return NULL;
     }
     anland_scene_enable_frame_consumed(anland_de_backend_scene(b->backend));
+    update_watch_generation(b);
     anland_layer_desc_t layer = {
         .kind = ANLAND_LAYER_NORMAL, .name = "niri composite",
         .opacity = 1.0f, .visible = true
@@ -50,15 +76,61 @@ void anland_niri_close(anland_niri_bridge *b)
 }
 int anland_niri_pump(anland_niri_bridge *b, int timeout_ms)
 {
-    return b ? anland_de_backend_pump(b->backend, timeout_ms) : -1;
+    if (!b) return -1;
+    const int rc = anland_de_backend_pump(b->backend, timeout_ms);
+    update_watch_generation(b);
+    return rc;
 }
 int anland_niri_reconnect(anland_niri_bridge *b)
 {
-    return b ? anland_de_backend_reconnect(b->backend) : -1;
+    if (!b) return -1;
+    errno = 0;
+    const int rc = anland_de_backend_reconnect(b->backend);
+    const int error = errno;
+    update_watch_generation(b);
+    if (rc != 0) errno = error ? error : EIO;
+    return rc;
 }
 int anland_niri_reopen(anland_niri_bridge *b, const char *endpoint)
 {
-    return b ? anland_de_backend_reopen(b->backend, endpoint) : -1;
+    if (!b) return -1;
+    const int rc = anland_de_backend_reopen_deferred(b->backend, endpoint);
+    /* A new socket can reuse the same descriptor number. Force re-registration. */
+    if (rc == 0 && ++b->watch_generation == 0) ++b->watch_generation;
+    update_watch_generation(b);
+    return rc;
+}
+int anland_niri_get_watch_fds(anland_niri_bridge *b,
+                              uint64_t known_generation,
+                              anland_niri_watch_fds *out)
+{
+    if (!b || !out) { errno = EINVAL; return -1; }
+    update_watch_generation(b);
+    *out = (anland_niri_watch_fds) {
+        .generation = b->watch_generation,
+        .socket_fd = -1,
+        .ready_fd = -1,
+        .socket_writable = b->watched_socket_writable,
+    };
+    if (known_generation == b->watch_generation)
+        return 0;
+
+    if (b->watched_socket_fd >= 0) {
+        out->socket_fd = fcntl(b->watched_socket_fd, F_DUPFD_CLOEXEC, 0);
+        if (out->socket_fd < 0)
+            return -1;
+    }
+    if (b->watched_ready_fd >= 0) {
+        out->ready_fd = fcntl(b->watched_ready_fd, F_DUPFD_CLOEXEC, 0);
+        if (out->ready_fd < 0) {
+            const int saved = errno;
+            if (out->socket_fd >= 0) close(out->socket_fd);
+            out->socket_fd = -1;
+            errno = saved;
+            return -1;
+        }
+    }
+    return 0;
 }
 int anland_niri_connected(anland_niri_bridge *b)
 {
@@ -74,7 +146,10 @@ uint64_t anland_niri_generation(anland_niri_bridge *b)
 }
 void anland_niri_drop_session(anland_niri_bridge *b)
 {
-    if (b) anland_de_backend_drop_session(b->backend);
+    if (b) {
+        anland_de_backend_drop_session(b->backend);
+        update_watch_generation(b);
+    }
 }
 void anland_niri_reset_input(anland_niri_bridge *b)
 {

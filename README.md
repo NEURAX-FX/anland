@@ -534,8 +534,8 @@ machine is unchanged from V2.**
 ### 9.1 Producer state machine
 
 `connect_to_deamon()` performs **only** the daemon handshake (it fetches `screen_info`)
-and deliberately leaves the context in fallback. The backend then runs a timer
-(`RECONNECT_INTERVAL_MS = 200 ms`) that polls `try_exit_fallback()`.
+and deliberately leaves the context in fallback. Niri advances the handshake
+from socket readiness; other adapters retain their existing timer policies.
 
 ```mermaid
 stateDiagram-v2
@@ -544,27 +544,51 @@ stateDiagram-v2
     Disconnected --> Fallback: connect_to_deamon() OK<br/>got screen_info
     Disconnected --> [*]: connect failed
 
-    Fallback --> Fallback: try_exit_fallback() == -1<br/>no consumer yet<br/>wait 200ms then retry
+    Fallback --> Fallback: incomplete handshake<br/>wait for readiness or adapter timer
     Fallback --> Connected: try_exit_fallback() == 0<br/>fds + dmabufs in hand
 
     Connected --> Connected: render frames
     Connected --> Fallback: consumer lost<br/>POLLHUP / send fail → enter_fallback()
 
     note right of Fallback
-        timer polls every 200ms
+        Niri waits for socket readiness
+        other adapters may use a 200ms timer
     end note
 ```
 
-`try_exit_fallback()` is **two‑step and atomic** — fallback clears only when *both*
-succeed (`display_producer.c`):
+`try_exit_fallback()` is a nonblocking staged handshake: first receive the five
+`FDS_READY` descriptors `{buf_ready, fence, data, shm, audio}`, then buffer metadata
+and fds on the data channel. `EAGAIN` preserves partial records and ownership;
+only transport/protocol failure discards an attempt. Pool metadata still needs
+a real slot-ready signal. GPU staging's fence and cache policies are unchanged.
 
-1. **`pickup_fds()`** — send `PICKUP_FDS`, poll `ctrl_fd` (100 ms) for `FDS_READY`,
-   receive **4** fds, `mmap` the shm.
-2. **`receive_dmabufs()`** — poll `data_fd` (100 ms) for `BUFS_READY`, store the dmabuf
-   set.
+Niri no longer uses a 1 ms reconnect poll. It watches writability only for an
+unfinished `PICKUP_FDS` send, otherwise readability, plus the active session's
+buffer-ready fd. Real failures back off from 100 ms to 2 s with old watches
+removed. A 50 ms housekeeping timer does not retry healthy pending handshakes.
+Deferred daemon reopen waits for `SCREEN_INFO` without blocking the main loop;
+other WMs retain their strict reopen behavior.
 
-Any failure → `release_consumer_resources()` and stay in fallback, safe to retry next
-tick.
+### MT6989 userspace deployment
+
+On 2026-11-21 the GPU-preserving AArch64 Niri and its two producer libraries were
+replaced under `/opt/anland/gpu-staging-619719b9/`, followed by
+`systemctl --user restart niri.service`. The service became `active/running`,
+Niri PID 9626 answered IPC with a 2392×1080 output at 120000 mHz, and five one-second
+`pidstat` samples averaged 0.60% CPU (one logical core is 100%). This is not an FPS
+or sustained-load benchmark. PanVK, ICD selectors, Niri config and kernel were
+unchanged. Startup/IPC were verified; Android screen capture was unavailable
+because `screencap` could not load `libGBDumper.so`, so no visual claim is made.
+
+Previous runtime files and a syntax-checked, unexecuted rollback script are kept
+under `/root/panvk-wsi-debug/backup-niri-gpu-idle-30586c15/`. Roll back with:
+
+```sh
+bash /root/panvk-wsi-debug/backup-niri-gpu-idle-30586c15/rollback.sh
+```
+
+Rollback restores only these three userspace files and restarts the same service;
+it refuses to overwrite a newer runtime.
 
 ### 9.2 Consumer state machine
 
